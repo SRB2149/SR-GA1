@@ -11,8 +11,8 @@ module MUX_unit_test;
     //===================================
     // Parameters (fill in real values)
     //===================================
-    localparam W = 1;  /* TODO: set value */
-    localparam SEL_W = 1;  /* TODO: set value */
+    localparam W = 1;
+    localparam SEL_W = 3;
 
     //===================================
     // Signals wired to the UUT ports
