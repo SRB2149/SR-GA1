@@ -5,3 +5,6 @@ scripts/__pycache__
 *.log
 **/.svunit.f
 **/.testrunner.sv
+*.wlf
+*.vcd
+**/transcript
