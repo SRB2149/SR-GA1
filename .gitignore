@@ -1,0 +1,7 @@
+scripts/__pycache__
+**/work
+**/.__testsuite.sv
+**/tests.xml
+*.log
+**/.svunit.f
+**/.testrunner.sv
