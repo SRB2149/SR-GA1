@@ -11,23 +11,21 @@ module MUX_unit_test;
     //===================================
     // Parameters (fill in real values)
     //===================================
-    localparam W = 1;
     localparam SEL_W = 3;
 
     //===================================
     // Signals wired to the UUT ports
     //===================================
-    logic [W-1:0] in [2**SEL_W-1:0];
-    logic [SEL_W-1:0] sel;
-    logic [W-1:0] out;
+    logic [2**SEL_W-1:0]    in;
+    logic [SEL_W-1:0]       sel;
+    logic                   out;
 
     //===================================
     // This is the UUT that we're
     // running the Unit Tests on
     //===================================
     MUX #(
-        .W(W),
-    .SEL_W(SEL_W)
+        .SEL_W(SEL_W)
     ) my_MUX (
         .in(in),
         .sel(sel),
