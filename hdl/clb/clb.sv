@@ -9,16 +9,16 @@
 //   5   | operation_select[2]
 //   6   | minor_horz_sel[0]
 //   7   | minor_horz_sel[1]
-//   8   | minor_horz_sel[2]
-//   9   | minor_vert_sel[0]
-//   10  | minor_vert_sel[1]
-//   11  | minor_vert_sel[2]
-//   12  | major_horz_sel[0]
-//   13  | major_horz_sel[1]
-//   14  | major_horz_sel[2]
-//   15  | major_vert_sel[0]
-//   16  | major_vert_sel[1]
-//   17  | major_vert_sel[2]
+//   8   | minor_vert_sel[0]
+//   9   | minor_vert_sel[1]
+//   10  | minor_vert_sel[2]
+//   11  | minor_vert_sel[3]
+//   12  | major_horz2_sel[0]
+//   13  | major_horz2_sel[1]
+//   14  | major_horz2_sel[2]
+//   15  | major_horz3_sel[0]
+//   16  | major_horz3_sel[1]
+//   17  | major_horz3_sel[2]
 //   18  | op_ff_reset_val
 //
 // Layout (pins not necessarily in exact shown positions, just done to show which edge each is on)
@@ -105,12 +105,14 @@ module CLB (
     
     // Output signals
     logic [7:0] output_mux_in;
-    logic [2:0] minor_horz_sel, minor_vert_sel, major_horz_sel, major_vert_sel;
+    logic [3:0] minor_vert_sel;
+    logic [2:0] major_horz3_sel, major_horz2_sel;
+    logic [1:0] minor_horz_sel;
     
-    assign minor_horz_sel = reg_data[8:6];
-    assign minor_vert_sel = reg_data[11:9];
-    assign major_horz_sel = reg_data[14:12];
-    assign major_vert_sel = reg_data[17:15];
+    assign minor_horz_sel = reg_data[7:6];
+    assign minor_vert_sel = reg_data[11:8];
+    assign major_horz2_sel = reg_data[14:12];
+    assign major_horz3_sel = reg_data[17:15];
     assign shift_clk_out = shift_clk;   // Shift clock passthrough into deeper cells
     assign clk_out = clk;               // Clock passthrough into deeper cells
     assign reset_out = reset;           // Reset passthrough into deeper cells
@@ -182,23 +184,25 @@ module CLB (
     begin : minor_output_muxes
         horz_bus_out[0] = minor_horz_sel[0] ? horz_bus_in[0] : operation_result;
         horz_bus_out[1] = minor_horz_sel[1] ? horz_bus_in[1] : operation_result;
-        horz_bus_out[2] = minor_horz_sel[2] ? horz_bus_in[2] : operation_result;
         
-        vert_bus_out[0] = minor_vert_sel[0] ? vert_bus_in[0] : operation_result;
-        vert_bus_out[1] = minor_vert_sel[1] ? vert_bus_in[1] : operation_result;
-        vert_bus_out[2] = minor_vert_sel[2] ? vert_bus_in[2] : operation_result;
+        // Snaking vertical bus allows for 4 signals to propagate with 2 able to
+        // be put onto the horizontal bus output at once.
+        vert_bus_out[0] = minor_vert_sel[0] ? vert_bus_in[2] : operation_result;
+        vert_bus_out[1] = minor_vert_sel[1] ? vert_bus_in[3] : operation_ff;
+        vert_bus_out[2] = minor_vert_sel[2] ? vert_bus_in[0] : operation_result;
+        vert_bus_out[3] = minor_vert_sel[3] ? vert_bus_in[1] : operation_ff;
     end
     
     // Major output multiplexers
     always_comb
     begin : major_output_muxes
         output_mux_in = {       // INDEX
-            1'b0,               //   7
-            carry,              //   6
-            operation_ff,       //   5
-            operation_result,   //   4
-            horz_bus_in[3],     //   3
-            vert_bus_in[3],     //   2         
+            carry,              //   7
+            operation_ff,       //   6
+            operation_result,   //   5
+            horz_bus_in[3],     //   4
+            vert_bus_in[3],     //   3         
+            vert_bus_in[2],     //   2         
             1'b1,               //   1
             1'b0                //   0
         };
@@ -206,18 +210,18 @@ module CLB (
     
     MUX #(
         .SEL_W(3)
-    ) major_output_mux_horz_u (
+    ) major_output_mux_h2_u (
         .in(output_mux_in),
-        .sel(major_horz_sel),
-        .out(horz_bus_out[3])
+        .sel(major_horz2_sel),
+        .out(horz_bus_out[2])
     );
     
     MUX #(
         .SEL_W(3)
-    ) major_output_mux_vert_u (
+    ) major_output_mux_h3_u (
         .in(output_mux_in),
-        .sel(major_vert_sel),
-        .out(vert_bus_out[3])
+        .sel(major_horz3_sel),
+        .out(horz_bus_out[3])
     );
 
 endmodule
