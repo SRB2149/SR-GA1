@@ -9,3 +9,4 @@ scripts/__pycache__
 *.vcd
 **/transcript
 **/project.resolved.f
+**/.__*
