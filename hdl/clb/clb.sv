@@ -20,6 +20,41 @@
 //   16  | major_vert_sel[1]
 //   17  | major_vert_sel[2]
 //   18  | op_ff_reset_val
+//
+// Layout (pins not necessarily in exact shown positions, just done to show which edge each is on)
+//                  v v v v
+//                  | | | |
+//                  b b b b
+//                  u u u u   r
+//                  s s s s   e
+//                  | | | | c s
+//                  o o o o l e
+//                  u u u u k t
+//                  t t t t | |
+//                  - - - - o o
+//                  0 1 2 3 u u
+//                  - - - - t t
+//                     
+//                 _|_|_|_|_|_|_
+// h_bus_in[0]   -|             |- h_bus_out[0]
+// h_bus_in[1]   -|             |- h_bus_out[1]
+// h_bus_in[2]   -|    SR-GA1   |- h_bus_out[2]
+// h_bus_in[3]   -|    CLB      |- h_bus_out[3]
+// shift_clk     -|             |- shift_clk_out
+// shift_data_in -|_ _ _ _ _ _ _|- shift_data_out
+//                  | | | | | |
+//
+//                  v v v v c r
+//                  | | | | l e
+//                  b b b b k s
+//                  u u u u   e
+//                  s s s s   t
+//                  | | | |
+//                  i i i i
+//                  n n n n
+//                  - - - -
+//                  0 1 2 3
+//                  - - - -
 
 module CLB (
     // Programming interface
