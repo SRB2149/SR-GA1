@@ -66,7 +66,7 @@ SURFER ?= surfer
 # override with `make sim ... PROJECT_FILELIST=/path/to/other.f` if needed.
 # If the file doesn't exist, sim/sim_all just skip it with a warning rather
 # than failing, since not every checkout may have it.
-PROJECT_FILELIST ?= $(MAKEFILE_DIR)sr-ga1.f
+PROJECT_FILELIST ?= $(MAKEFILE_DIR)all_files.f
 
 .PHONY: new_tb sim sim_all wave wave_all wave_vcd wave_vcd_all
 
