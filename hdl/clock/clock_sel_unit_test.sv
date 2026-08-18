@@ -93,6 +93,8 @@ module Clock_Selector_unit_test;
             shift_in(config_val[2-i]);
         end
         
+        #1ns;
+        
         shift_clk_enable = '0;
     endtask
     
