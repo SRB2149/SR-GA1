@@ -17,7 +17,7 @@ module Clock_Bank # (
     genvar i;
     generate
         for (i = 0; i < CLK_NUM; i++)
-        begin
+        begin : gen_block
             Clock_Selector clk_sel_u (
                 .shift_clk(shift_clk),
                 .shift_data_in(shift_data[i]),
@@ -25,20 +25,20 @@ module Clock_Bank # (
                 
                 // Fabric Connections
                 .bus(buses[i]),
-                .prev_clk(prev_clk),
+                .prev_clk(prev_clk[i]),
                 .clk(clks[i])
             );
-        end
-        
-        always_comb
-        begin : clk_routing
-            if (i == 0)
-            begin
-                prev_clk = clks[CLK_NUM-1];
-            end
-            else
-            begin
-                prev_clk = clks[i-1];
+            
+            always_comb
+            begin : clk_routing
+                if (i == 0)
+                begin
+                    prev_clk[i] = clks[CLK_NUM-1];
+                end
+                else
+                begin
+                    prev_clk[i] = clks[i-1];
+                end
             end
         end
     endgenerate
