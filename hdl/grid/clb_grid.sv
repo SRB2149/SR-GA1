@@ -27,47 +27,110 @@
 //      so 000 -> 001 -> 002 -> 003 -> 004 and so on (raster pattern).
 
 module CLB_Grid #(
-    parameter ROWS      = 5,
-    parameter COLUMNS   = 5
+    parameter int ROWS    = 4,
+    parameter int COLUMNS = 7
 )(
     // Programming interface
     input   logic       shift_clk,
-    output  logic       shift_clk_out,
     input   logic       shift_data_in,
     output  logic       shift_data_out,
-    
+
     // Global reset (synchronous to column clocks)
     input   logic       reset,
-    
+
     // Column clocks
     input   logic       column_clks [COLUMNS],
-    
+
     // Grid Buses
-    input  logic [3:0] horz_bus_in [ROWS],
-    output logic [3:0] horz_bus_out [ROWS],
-    input  logic [3:0] vert_bus_in [COLUMNS],
-    output logic [3:0] vert_bus_out [COLUMNS]
+    input   logic [3:0]  horz_bus_in  [ROWS],
+    output  logic [3:0]  horz_bus_out [ROWS],
+    input   logic [3:0]  vert_bus_in  [COLUMNS],
+    output  logic [3:0]  vert_bus_out [COLUMNS]
 );
 
-    logic shift_data [ROWS * COLUMNS];
+    // One entry per grid cell for every signal that chains between neighbors.
+    // NOTE: assumes CLB has clk_out/reset_out relay outputs, based on your
+    // original code reading them from neighboring instances -- adjust the
+    // port names below if that's not actually CLB's interface.
+    logic [3:0] horz_chain      [ROWS][COLUMNS];
+    logic [3:0] vert_chain      [ROWS][COLUMNS];
+    logic       clk_chain       [ROWS][COLUMNS];
+    logic       reset_chain     [ROWS][COLUMNS];
+    logic       shift_clk_chain [ROWS][COLUMNS];
+    logic       shift_data_chain[ROWS][COLUMNS];
 
     genvar r, c;
     generate
         for (r = 0; r < ROWS; r++) begin : row
             for (c = 0; c < COLUMNS; c++) begin : col
-                CLB clb_inst (
-                    .shift_clk(c == 0 ? shift_clk : row[r].col[c-1].clb_inst.shift_clk_out),
-                    .shift_data_in((r == 0 && c == 0) ? shift_data_in : shift_data[r * COLUMNS + c - 1]),
-                    .shift_data_out(shift_data[r * COLUMNS + c]),
-                    .clk(r == 0 ? column_clks[c] : row[r-1].col[c].clb_inst.clk_out),
-                    .reset(r == 0 ? reset : row[r-1].col[c].clb_inst.reset_out),
-                    .horz_bus_in(c == 0 ? horz_bus_in[r] : row[r].col[c-1].clb_inst.horz_bus_out),
-                    .vert_bus_in(r == 0 ? vert_bus_in[c] : row[r-1].col[c].clb_inst.vert_bus_out)
+
+                logic [3:0] horz_in_sel;
+                logic       shift_clk_in_sel;
+                logic       shift_data_in_sel;
+                logic       clk_in_sel;
+                logic       reset_in_sel;
+                logic [3:0] vert_in_sel;
+
+                // Horizontal chain: edge cell pulls from the grid's own
+                // input port; interior cells pull from the cell to the left.
+                if (c == 0) begin : horz_edge
+                    assign horz_in_sel      = horz_bus_in[r];
+                    assign shift_clk_in_sel = shift_clk;
+                end else begin : horz_interior
+                    assign horz_in_sel      = horz_chain[r][c-1];
+                    assign shift_clk_in_sel = shift_clk_chain[r][c-1];
+                end
+
+                // Shift-register chain snakes through every cell in
+                // row-major order, wrapping from the end of one row to
+                // the start of the next.
+                if (r == 0 && c == 0) begin : shift_first_cell
+                    assign shift_data_in_sel = shift_data_in;
+                end else if (c == 0) begin : shift_row_wrap
+                    assign shift_data_in_sel = shift_data_chain[r-1][COLUMNS-1];
+                end else begin : shift_interior
+                    assign shift_data_in_sel = shift_data_chain[r][c-1];
+                end
+
+                // Vertical chain: edge cell (top row) pulls from the grid's
+                // own input ports; interior cells pull from the cell above.
+                if (r == 0) begin : vert_edge
+                    assign clk_in_sel   = column_clks[c];
+                    assign reset_in_sel = reset;
+                    assign vert_in_sel  = vert_bus_in[c];
+                end else begin : vert_interior
+                    assign clk_in_sel   = clk_chain[r-1][c];
+                    assign reset_in_sel = reset_chain[r-1][c];
+                    assign vert_in_sel  = vert_chain[r-1][c];
+                end
+
+                CLB clb_u (
+                    .shift_clk      (shift_clk_in_sel),
+                    .shift_clk_out  (shift_clk_chain[r][c]),
+                    .shift_data_in  (shift_data_in_sel),
+                    .shift_data_out (shift_data_chain[r][c]),
+                    .clk            (clk_in_sel),
+                    .clk_out        (clk_chain[r][c]),
+                    .reset          (reset_in_sel),
+                    .reset_out      (reset_chain[r][c]),
+                    .horz_bus_in    (horz_in_sel),
+                    .horz_bus_out   (horz_chain[r][c]),
+                    .vert_bus_in    (vert_in_sel),
+                    .vert_bus_out   (vert_chain[r][c])
                 );
+
+                // Drive the grid's own output ports from the far edge cells.
+                if (c == COLUMNS-1) begin : horz_out_edge
+                    assign horz_bus_out[r] = horz_chain[r][c];
+                end
+                if (r == ROWS-1) begin : vert_out_edge
+                    assign vert_bus_out[c] = vert_chain[r][c];
+                end
+
             end
         end
     endgenerate
-    
-    assign shift_data_out = shift_data[ROWS * COLUMNS - 1];
+
+    assign shift_data_out = shift_data_chain[ROWS-1][COLUMNS-1];
 
 endmodule
