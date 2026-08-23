@@ -172,7 +172,7 @@ module CLB (
         end
         else
         begin
-            if (horz_bus_in[0])
+            if (horz_bus_in[3])
             begin
                 operation_ff <= operation_result;
             end

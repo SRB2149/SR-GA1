@@ -294,7 +294,7 @@ module CLB_unit_test;
     `SVTEST(test_operation_ff)
         for (int val = 0; val < 2; val++)
         begin
-            configure_all(1'b1, 1'b1, 1'b1, 3'b111, 2'b00, 4'b0000, 3'b000, 3'b000, 1'(val));
+            configure_all(1'b1, 1'b1, 1'b0, 3'b111, 2'b00, 4'b0000, 3'b000, 3'b000, 1'(val));
             
             //Testing synchronous reset
             reset = '1;
@@ -312,7 +312,7 @@ module CLB_unit_test;
             `FAIL_UNLESS_EQUAL(my_CLB.operation_ff, 1'(val))
             
             //Test setting via fabric after reset
-            horz_bus_in = 4'b0001;
+            horz_bus_in = 4'b1000;
             
             @(posedge clk);
             
@@ -320,7 +320,7 @@ module CLB_unit_test;
             
             `FAIL_UNLESS_EQUAL(my_CLB.operation_ff, 1'b0)
             
-            horz_bus_in = 4'b0101;
+            horz_bus_in = 4'b1111;
             
             @(posedge clk);
             
@@ -369,9 +369,10 @@ module CLB_unit_test;
     `SVTEST(test_vert_minor_muxes)
         for (logic [4:0] mux = 0; mux < 16; mux++)
         begin
-            configure_all(1'b1, 1'b1, 1'b1, 3'b001, 2'b00, 4'(mux), 3'b000, 3'b000, 1'b0);
+            configure_all(1'b0, 1'b0, 1'b0, 3'b001, 2'b00, 4'(mux), 3'b000, 3'b000, 1'b0);
             
-            horz_bus_in[0] = '1;
+            //Setting operation_ff
+            horz_bus_in[3] = '1;
             
             for (logic [5:0] data = 0; data < 32; data++)
             begin
