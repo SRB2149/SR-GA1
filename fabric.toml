@@ -1,0 +1,244 @@
+# fabric.toml — SR-GA1 fabric description
+#
+# Single source of truth for the FPGA tool. The application never reads the
+# SystemVerilog: every dimension, config field, mux legality table and the
+# bitstream ordering comes from this file. It is validated on load with
+# line-referenced errors, so hand edits that break an invariant are reported
+# rather than silently misconfiguring the tool.
+#
+# Source tokens used in the mux tables below. A mux's `sources` are listed in
+# select-code order: sources[k] is what the mux drives when its select field
+# holds the value k.
+#
+#   h_in:N    incoming horizontal bus, lane N   (pass-through: net name continues)
+#   v_in:N    incoming vertical bus, lane N     (pass-through: net name continues)
+#   const:0   constant zero -> reserved net named by naming.constant_zero
+#   const:1   constant one  -> reserved net named by naming.constant_one
+#   op        this CLB's combinational operation result -> new net <CLB>_op
+#   reg       this CLB's flip-flop output               -> new net <CLB>_reg
+#   carry     this CLB's carry output                   -> new net <CLB>_carry
+#   carry_in  the dedicated carry chain input, from the cell below
+#             (pass-through: carries that cell's <CLB>_carry name)
+#   v_ring:N  (CSB only) the column's vertical ring at the loop tap, lane N
+
+schema = 1
+
+[fabric]
+name = "SR-GA1"
+# Grid size. 7x4 today; 12x4 and 16x4 must work by editing only `columns`.
+# The [io] maps are written one line per row, so changing `rows` also means
+# editing those. Everything else (CSB count, bus segments, bitstream length)
+# derives from these two numbers.
+columns = 7
+rows = 4
+
+[buses]
+# Horizontal lanes per row, flowing left (input controller) to right (output
+# controller), segmented at every CLB.
+horizontal = 4
+# Vertical lanes per column, flowing row 0 upward and then looping from the
+# top row back into row 0 — a closed ring. The CSB taps the ring at that loop
+# point. The lane swap on vertical pass-through (0<->2, 1<->3 per hop) is
+# expressed in the output mux tables below, not here.
+vertical = 4
+vertical_ring = true
+
+[clb]
+# Configuration fields in shift-register index order: the first field holds
+# chain index 0 (nearest shift_data_in), and a multi-bit field places its LSB
+# at its lowest index. All fields default to 0.
+fields = [
+    { name = "input_mux_a_sel", width = 1 },
+    { name = "input_mux_b_sel", width = 1 },
+    { name = "input_mux_c_sel", width = 2 },
+    { name = "operation_select", width = 3 },
+    { name = "minor_horz_sel", width = 2 },
+    { name = "minor_vert_sel", width = 4 },
+    { name = "major_horz2_sel", width = 3 },
+    { name = "major_horz3_sel", width = 3 },
+    { name = "op_ff_reset_val", width = 1 },
+]
+
+# The three operation inputs. Each mux straddles two adjacent horizontal
+# lanes. `select` names a config field, or one bit of one with `field[bit]`.
+[[clb.input_muxes]]
+name = "a"
+select = "input_mux_a_sel"
+sources = ["h_in:0", "h_in:1"]
+
+[[clb.input_muxes]]
+name = "b"
+select = "input_mux_b_sel"
+sources = ["h_in:1", "h_in:2"]
+
+# Input c is the adder's third operand: as well as the two horizontal lanes
+# it reaches the vertical bus and the carry chain, which makes the cell a
+# full adder (pick XOR3 for the sum bit; carry_out follows automatically).
+#
+# NOTE: v_in:0 is a combinational lane -- vertical lanes 0 and 2 carry `op`,
+# lanes 1 and 3 carry `reg`. Feeding lane 0 back into the logic means a
+# vertical ring configured as pass-through can close a combinational loop
+# through a CLB's own operation core. DRC reports such loops as errors and
+# the simulator refuses to settle rather than hanging.
+[[clb.input_muxes]]
+name = "c"
+select = "input_mux_c_sel"
+sources = ["h_in:2", "h_in:3", "v_in:0", "carry_in"]
+
+[clb.carry]
+# Dedicated carry chain, one per column, running from row 0 upward: a cell's
+# carry output feeds the carry input of the cell in the row above. Row 0's
+# carry input is the constant below. Unlike the vertical bus this chain does
+# NOT wrap at the top -- a wrap would close a combinational loop through the
+# adder core.
+chain = "column_up"
+edge = 0
+
+[clb.operation]
+# The fixed operation core: `select` picks one of the ops below. Each truth
+# table has 2^3 entries indexed by the input muxes in listed order, input "a"
+# as bit 0: entry i is the result for a = i.0, b = i.1, c = i.2.
+select = "operation_select"
+ops = [
+    { code = 0, name = "AND3",  table = [0,0,0,0,0,0,0,1] },
+    { code = 1, name = "OR3",   table = [0,1,1,1,1,1,1,1] },
+    { code = 2, name = "XOR3",  table = [0,1,1,0,1,0,0,1] },
+    { code = 3, name = "NAND3", table = [1,1,1,1,1,1,1,0] },
+    { code = 4, name = "NOR3",  table = [1,0,0,0,0,0,0,0] },
+    { code = 5, name = "XNOR3", table = [1,0,0,1,0,1,1,0] },
+    { code = 6, name = "AO21",  table = [0,0,0,1,1,1,1,1] },
+    { code = 7, name = "MUX2",  table = [0,0,1,1,0,1,0,1] },
+]
+# The carry output, always computed regardless of the selected op: the
+# full-adder carry of a + b + c. Same indexing as the op tables.
+carry_table = [0,0,0,1,0,1,1,1]
+
+[clb.ff]
+# The flip-flop's data input is hard-wired to the operation result, and
+# horizontal lane 3 is its write enable. Global reset is synchronous, wins
+# over the enable, and loads the value in `reset_value_field`.
+data = "op"
+enable = "h_in:3"
+edge = "rising"
+reset = "sync"
+reset_value_field = "op_ff_reset_val"
+
+# The eight output muxes: every outgoing lane is driven by exactly one.
+# h_out:N / v_out:N are the outgoing horizontal / vertical lanes.
+
+[[clb.output_muxes]]
+drives = "h_out:0"
+select = "minor_horz_sel[0]"
+sources = ["op", "h_in:0"]
+
+[[clb.output_muxes]]
+drives = "h_out:1"
+select = "minor_horz_sel[1]"
+sources = ["op", "h_in:1"]
+
+# The vertical pass-throughs swap lane pairs at every hop (in 2 -> out 0,
+# in 3 -> out 1, in 0 -> out 2, in 1 -> out 3).
+[[clb.output_muxes]]
+drives = "v_out:0"
+select = "minor_vert_sel[0]"
+sources = ["op", "v_in:2"]
+
+[[clb.output_muxes]]
+drives = "v_out:1"
+select = "minor_vert_sel[1]"
+sources = ["reg", "v_in:3"]
+
+[[clb.output_muxes]]
+drives = "v_out:2"
+select = "minor_vert_sel[2]"
+sources = ["op", "v_in:0"]
+
+[[clb.output_muxes]]
+drives = "v_out:3"
+select = "minor_vert_sel[3]"
+sources = ["reg", "v_in:1"]
+
+# Each major mux pairs with its own lane: codes 2 and 3 take that lane's own
+# vertical and horizontal input, and codes 6 and 7 cross over to the other
+# major lane's pair (2 <-> 3), so either bus signal can reach either lane.
+# Codes 2/3/6/7 are the fabric's only vertical -> horizontal bridges.
+# Carry is not here: it leaves the cell on the dedicated chain instead, and
+# is read back through the next cell's input mux c.
+[[clb.output_muxes]]
+drives = "h_out:2"
+select = "major_horz2_sel"
+sources = ["const:0", "const:1", "v_in:2", "h_in:2", "op", "reg", "v_in:3", "h_in:3"]
+
+[[clb.output_muxes]]
+drives = "h_out:3"
+select = "major_horz3_sel"
+sources = ["const:0", "const:1", "v_in:3", "h_in:3", "op", "reg", "v_in:2", "h_in:2"]
+
+[csb]
+# One clock selector per column, at the bottom of the fabric. Same field
+# ordering rules as the CLB.
+fields = [
+    { name = "bus_addr", width = 2 },
+    { name = "couple_to_previous", width = 1 },
+]
+
+[csb.clock]
+# When `couple_field` is 1 the CSB takes the previous CSB's clock and
+# `select` is ignored; column N couples from column N-1 and column 0 from the
+# last column, closing a loop. Otherwise `select` picks a vertical ring lane
+# at the column's loop tap (after the top row, before re-entering row 0).
+select = "bus_addr"
+sources = ["v_ring:0", "v_ring:1", "v_ring:2", "v_ring:3"]
+couple_field = "couple_to_previous"
+
+[io]
+# Net names driven onto each row's horizontal lanes at the left edge: one
+# line per row (row 0 first), one entry per lane (lane 0 first). These are
+# reserved names. Row 3's constants mean its lane-3 FF enables enter as 1.
+# The IO controllers hold no config bits.
+inputs = [
+    ["input_0", "input_1", "input_2", "input_3"],
+    ["input_4", "input_5", "input_6", "input_7"],
+    ["input_8", "input_9", "ddio_in_0", "ddio_in_1"],
+    ["fixed_zero", "fixed_one", "fixed_zero", "fixed_one"],
+]
+# Chip outputs read from each row's horizontal lanes at the right edge.
+# "" marks an unused lane.
+outputs = [
+    ["output_0", "output_1", "output_2", "output_3"],
+    ["output_4", "output_5", "output_6", "output_7"],
+    ["output_8", "output_9", "ddio_out_0", "ddio_out_1"],
+    ["ddio_dir_0", "ddio_dir_1", "", ""],
+]
+# Dual-direction pads: when `dir` is 1 the pad drives `out` and `in` is
+# forced to 0.
+ddio = [
+    { in = "ddio_in_0", out = "ddio_out_0", dir = "ddio_dir_0" },
+    { in = "ddio_in_1", out = "ddio_out_1", dir = "ddio_dir_1" },
+]
+
+[bitstream]
+# The physical shift chain in data-flow order: shift_data_in enters the first
+# group below. Within a cell, fields shift in their listed order (chain index
+# 0 nearest the input). First-shifted bits travel deepest, so the exported
+# transmission order is the reverse of all of this: the last cell's highest
+# bit is emitted first and the first cell's bit 0 last. The exporter derives
+# that; this section only declares the chain.
+chain = [
+    { cells = "clb", order = "row_major" },        # (r0,c0) (r0,c1) ... (r3,c6)
+    { cells = "csb", order = "column_ascending" }, # CSB0 ... CSB6
+]
+
+[naming]
+# {col} and {row} are substituted with the block's grid position.
+clb = "CLB{col}_{row}"
+csb = "CSB{col}"
+suffix_op = "_op"
+suffix_reg = "_reg"
+suffix_carry = "_carry"
+constant_zero = "fixed_zero"
+constant_one = "fixed_one"
+# A column clock takes the resolved name of the net its CSB selects; this
+# fallback applies only when that net has no resolvable name.
+clock_fallback = "CSB{col}_clock"
+unconnected = "<unconnected>"
