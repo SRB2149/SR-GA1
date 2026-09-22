@@ -22,10 +22,10 @@ module SR_GA1 (
     // The IO controller will need to be edited to add more rows.
     
     // CLB Routing
-    logic [3:0] vertical_buses  [COLUMNS];
-    logic       column_clks [COLUMNS];
-    logic [3:0] to_fabric_buses [4];
-    logic [3:0] from_fabric_buses [4];
+    logic [(4*COLUMNS)-1:0] vertical_buses;
+    logic [COLUMNS-1:0]     column_clks;
+    logic [15:0]            to_fabric_buses;
+    logic [15:0]            from_fabric_buses;
     
     // Configuration Routing
     logic clb_clk_data_bridge;

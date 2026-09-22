@@ -20,8 +20,8 @@ module Clock_Bank_unit_test;
     logic shift_clk;
     logic shift_data_in;
     logic shift_data_out;
-    logic [3:0] buses [CLK_NUM];
-    logic clks [CLK_NUM];
+    logic [(4*CLK_NUM)-1:0] buses;
+    logic [CLK_NUM-1:0] clks;
 
     logic shift_clk_pre_enable;
     logic shift_clk_enable;
@@ -68,7 +68,7 @@ module Clock_Bank_unit_test;
     task setup();
         svunit_ut.setup();
         /* Place Setup Code Here */
-        buses = '{4'd0, 4'd0, 4'd0, 4'd0, 4'd0, 4'd0, 4'd0};
+        buses = '0;
     endtask
 
 
@@ -136,14 +136,14 @@ module Clock_Bank_unit_test;
         
         #1ns;
         
-        buses[5][3] = '1;
+        buses[(4*5)+3] = '1;
         
         #1ns;
         
         `FAIL_UNLESS_EQUAL('1, clks[5])
         `FAIL_UNLESS_EQUAL('1, clks[6])
         
-        buses[5][3] = '0;
+        buses[(4*5)+3] = '0;
         
         #1ns;
         

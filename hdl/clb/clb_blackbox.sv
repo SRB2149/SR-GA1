@@ -10,10 +10,12 @@ module CLB (
     // Fabric Connections
     input   logic       clk,
     input   logic       reset,
+    input   logic       carry_in,
     input   logic [3:0] horz_bus_in,
     input   logic [3:0] vert_bus_in,
     output  logic       clk_out,
     output  logic       reset_out,
+    output  logic       carry_out,
     output  logic [3:0] horz_bus_out,
     output  logic [3:0] vert_bus_out
 );

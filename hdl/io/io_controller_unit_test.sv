@@ -16,8 +16,8 @@ module IO_Controller_unit_test;
     logic [1:0] ddio_in;
     logic [1:0] ddio_dir;
     logic [1:0] ddio_out;
-    logic [3:0] from_fabric_buses [4];
-    logic [3:0] to_fabric_buses [4];
+    logic [15:0] from_fabric_buses;
+    logic [15:0] to_fabric_buses;
     
     logic [9:0] out_temp;
     logic [1:0] dirs;
@@ -57,10 +57,7 @@ module IO_Controller_unit_test;
         
         chip_inputs = '0;
         ddio_in = '0;
-        from_fabric_buses[0] = '0;
-        from_fabric_buses[1] = '0;
-        from_fabric_buses[2] = '0;
-        from_fabric_buses[3] = '0;
+        from_fabric_buses = '0;
     endtask
 
 
@@ -97,10 +94,10 @@ module IO_Controller_unit_test;
             
             #1ns;
             
-            `FAIL_UNLESS_EQUAL(chip_inputs[3:0], to_fabric_buses[0])
-            `FAIL_UNLESS_EQUAL(chip_inputs[7:4], to_fabric_buses[1])
-            `FAIL_UNLESS_EQUAL(chip_inputs[9:8], to_fabric_buses[2][1:0])
-            `FAIL_UNLESS_EQUAL(4'b1010, to_fabric_buses[3])
+            `FAIL_UNLESS_EQUAL(chip_inputs[3:0], to_fabric_buses[3:0])
+            `FAIL_UNLESS_EQUAL(chip_inputs[7:4], to_fabric_buses[7:4])
+            `FAIL_UNLESS_EQUAL(chip_inputs[9:8], to_fabric_buses[9:8])
+            `FAIL_UNLESS_EQUAL(4'b1010, to_fabric_buses[15:12])
         end
         
         #1ns;
@@ -110,9 +107,9 @@ module IO_Controller_unit_test;
         for (int i=0; i<2**10; i++)
         begin
             out_temp = 10'(i);
-            from_fabric_buses[0] = out_temp[3:0];
-            from_fabric_buses[1] = out_temp[7:4];
-            from_fabric_buses[2][1:0] = out_temp[9:8];
+            from_fabric_buses[3:0] = out_temp[3:0];
+            from_fabric_buses[7:4] = out_temp[7:4];
+            from_fabric_buses[9:8] = out_temp[9:8];
             
             #1ns;
             
@@ -126,21 +123,21 @@ module IO_Controller_unit_test;
         for (int i=0; i<4; i++)
         begin
             dirs = 2'(i);
-            from_fabric_buses[3][1:0] = dirs;
+            from_fabric_buses[13:12] = dirs;
             
             for (int data=0; data<16; data++)
             begin
                 data_temp = 4'(data);
                 ddio_in = data_temp[1:0];
-                from_fabric_buses[2][3:2] = data_temp[3:2];
+                from_fabric_buses[11:10] = data_temp[3:2];
                 
                 #1ns;
                 
-                `FAIL_UNLESS_EQUAL(dirs[0] ? '0 : ddio_in[0], to_fabric_buses[2][2])
-                `FAIL_UNLESS_EQUAL(dirs[1] ? '0 : ddio_in[1], to_fabric_buses[2][3])
+                `FAIL_UNLESS_EQUAL(dirs[0] ? '0 : ddio_in[0], to_fabric_buses[10])
+                `FAIL_UNLESS_EQUAL(dirs[1] ? '0 : ddio_in[1], to_fabric_buses[11])
                 
-                `FAIL_UNLESS_EQUAL(from_fabric_buses[2][2], ddio_out[0])
-                `FAIL_UNLESS_EQUAL(from_fabric_buses[2][3], ddio_out[1])
+                `FAIL_UNLESS_EQUAL(from_fabric_buses[10], ddio_out[0])
+                `FAIL_UNLESS_EQUAL(from_fabric_buses[11], ddio_out[1])
             end
         end
         

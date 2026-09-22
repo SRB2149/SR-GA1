@@ -7,12 +7,12 @@ module Clock_Bank # (
     output  logic       shift_data_out,
     
     // Fabric Connections
-    input   logic [3:0] buses [CLK_NUM],
-    output  logic       clks [CLK_NUM]
+    input   logic [(4*CLK_NUM)-1:0] buses,
+    output  logic [CLK_NUM-1:0]     clks
 );
 
-    logic shift_data [CLK_NUM+1];
-    logic prev_clk   [CLK_NUM];
+    logic [CLK_NUM:0]   shift_data;
+    logic [CLK_NUM-1:0] prev_clk;
     
     genvar i;
     generate
@@ -24,7 +24,7 @@ module Clock_Bank # (
                 .shift_data_out(shift_data[i+1]),
                 
                 // Fabric Connections
-                .bus(buses[i]),
+                .bus(buses[(4*i) +: 4]),
                 .prev_clk(prev_clk[i]),
                 .clk(clks[i])
             );
