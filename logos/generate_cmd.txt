@@ -1,0 +1,1 @@
+python .\png_to_gds.py ..\logos\png\name.png -o ..\logos\gds\CHIP_ART_name.gds --no-top-cell --name CHIP_ART_name --pixel-size 0.6 --fix-diagonals bridge --bridge-size 0.6 --crop bot
