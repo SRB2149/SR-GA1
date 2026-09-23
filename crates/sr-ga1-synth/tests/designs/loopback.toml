@@ -1,0 +1,12 @@
+# Loop-around wiring available on the board.
+#
+# These pads are physically connected output-back-to-input, so the synthesiser
+# may use them as routing. It pairs them itself and reports the connections the
+# design actually needs.
+#
+# output_2/3 and output_6/7 are the outputs a register can drive directly: _reg
+# reaches only horizontal lanes 2 and 3, and those are the pads sitting on those
+# lanes in rows 0 and 1.
+[loopback]
+outputs = ["output_2", "output_3", "output_6", "output_7"]
+inputs  = ["input_0", "input_1", "input_4", "input_5"]

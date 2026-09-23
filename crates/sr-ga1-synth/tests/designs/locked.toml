@@ -1,0 +1,21 @@
+# Everything the constraints file can pin down, exercised at once.
+
+[loopback]
+outputs = ["output_2", "output_3", "output_6", "output_7"]
+inputs  = ["input_0", "input_1", "input_4", "input_5"]
+
+# Pin locks: a design signal on a named chip pad. output_2 is also a loop
+# source, which is allowed - a loop only taps the pad, so it can still carry a
+# design output.
+[pins]
+clk = "input_8"
+"count[0]" = "output_2"
+
+# The column whose CSB sources this clock domain.
+[clocks]
+clk = 5
+
+# A cell pinned to a CLB position, written "col,row". This is the top bit of the
+# adder, so the carry chain follows it into column 4.
+[placement]
+"count[3]" = "4,3"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fpga-core", "crates/fpgatool"]
+members = ["crates/fpga-core", "crates/fpgatool", "crates/sr-ga1-synth"]
 
 [profile.release]
 opt-level = 2
