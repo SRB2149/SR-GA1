@@ -42,19 +42,6 @@ module CLB_unit_test;
     logic exp_result_h2;
     logic exp_result_h3;
     logic exp_carry;
-    logic [7:0] lut_config;
-    
-    //LUT configurations for named operations (LUT index = {input_a, input_b, input_c})
-    logic [7:0] op_luts [8] = '{
-        8'h80,  //AND3
-        8'hFE,  //OR3
-        8'h96,  //XOR3
-        8'h7F,  //NAND3
-        8'h01,  //NOR3
-        8'h69,  //XNOR3
-        8'hEA,  //AO21
-        8'hE4   //MUX2
-    };
 
     //===================================
     // This is the UUT that we're
@@ -129,12 +116,12 @@ module CLB_unit_test;
         @(posedge shift_clk);
     endtask
     
-    task automatic configure(logic[24:0] config_val);
+    task automatic configure(logic[19:0] config_val);
         shift_clk_enable = '1;
         
-        for (int i = 0; i < 25; i++)
+        for (int i = 0; i < 20; i++)
         begin
-            shift_in(config_val[24-i]);
+            shift_in(config_val[19-i]);
         end
         
         shift_clk_enable = '0;
@@ -144,7 +131,7 @@ module CLB_unit_test;
         logic       input_mux_a_sel, 
         logic       input_mux_b_sel, 
         logic [1:0] input_mux_c_sel,
-        logic [7:0] lut,
+        logic [2:0] operation_select,
         logic [1:0] minor_horz_sel,
         logic [3:0] minor_vert_sel,
         logic [2:0] major_horz2_sel,
@@ -157,7 +144,7 @@ module CLB_unit_test;
             major_horz2_sel,
             minor_vert_sel,
             minor_horz_sel,
-            lut,
+            operation_select,
             input_mux_c_sel,
             input_mux_b_sel,
             input_mux_a_sel
@@ -167,21 +154,21 @@ module CLB_unit_test;
     `SVUNIT_TESTS_BEGIN
 
     `SVTEST(test_configure)
-        configure(25'h1FE1E0F);
+        configure(20'hFE1E0);
         #1ns;
-        `FAIL_UNLESS_EQUAL(my_CLB.reg_data, 25'h1FE1E0F)
+        `FAIL_UNLESS_EQUAL(my_CLB.reg_data, 20'hFE1E0)
         `FAIL_UNLESS_EQUAL(shift_data_out, 1'b1)
         #5ns;
     `SVTEST_END
 
     `SVTEST(test_input_a)
-        configure_all(1'b0, 1'b0, 2'b00, 8'h00, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
+        configure_all(1'b0, 1'b0, 2'b00, 3'b000, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_a, 1'b0)
         horz_bus_in = 4'b0001;
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_a, 1'b1)
-        configure_all(1'b1, 1'b0, 2'b00, 8'h00, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
+        configure_all(1'b1, 1'b0, 2'b00, 3'b000, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_a, 1'b0)
         horz_bus_in = 4'b0010;
@@ -190,13 +177,13 @@ module CLB_unit_test;
     `SVTEST_END
 
     `SVTEST(test_input_b)
-        configure_all(1'b0, 1'b0, 2'b00, 8'h00, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
+        configure_all(1'b0, 1'b0, 2'b00, 3'b000, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_b, 1'b0)
         horz_bus_in = 4'b0010;
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_b, 1'b1)
-        configure_all(1'b0, 1'b1, 2'b00, 8'h00, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
+        configure_all(1'b0, 1'b1, 2'b00, 3'b000, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_b, 1'b0)
         horz_bus_in = 4'b0100;
@@ -205,25 +192,25 @@ module CLB_unit_test;
     `SVTEST_END
     
     `SVTEST(test_input_c)
-        configure_all(1'b0, 1'b0, 2'b00, 8'h00, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
+        configure_all(1'b0, 1'b0, 2'b00, 3'b000, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_c, 1'b0)
         horz_bus_in = 4'b0100;
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_c, 1'b1)
-        configure_all(1'b0, 1'b0, 2'b01, 8'h00, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
+        configure_all(1'b0, 1'b0, 2'b01, 3'b000, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_c, 1'b0)
         horz_bus_in = 4'b1000;
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_c, 1'b1)
-        configure_all(1'b0, 1'b0, 2'b10, 8'h00, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
+        configure_all(1'b0, 1'b0, 2'b10, 3'b000, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_c, 1'b0)
         vert_bus_in = 4'b0001;
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_c, 1'b1)
-        configure_all(1'b0, 1'b0, 2'b11, 8'h00, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
+        configure_all(1'b0, 1'b0, 2'b11, 3'b000, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
         #1ns;
         `FAIL_UNLESS_EQUAL(my_CLB.input_c, 1'b0)
         carry_in = '1;
@@ -232,7 +219,7 @@ module CLB_unit_test;
     `SVTEST_END
     
     `SVTEST(test_clk_passthrough)
-        configure(25'd0);
+        configure(20'd0);
         `FAIL_UNLESS_EQUAL(clk, clk_out)
         clk = '1;
         #1ns;
@@ -243,7 +230,7 @@ module CLB_unit_test;
     `SVTEST_END
     
     `SVTEST(test_reset_passthrough)
-        configure(25'd0);
+        configure(20'd0);
         `FAIL_UNLESS_EQUAL(reset, reset_out)
         reset = '1;
         #1ns;
@@ -254,7 +241,7 @@ module CLB_unit_test;
     `SVTEST_END
     
     `SVTEST(test_shift_clk_passthrough)
-        configure(25'd0);
+        configure(20'd0);
         shift_clk_enable = '1;
         `FAIL_UNLESS_EQUAL(shift_clk, shift_clk_out)
         @(posedge shift_clk);
@@ -267,7 +254,7 @@ module CLB_unit_test;
     `SVTEST(test_operations)
         for (int op = 0; op < 8; op++)
         begin
-            configure_all(1'b0, 1'b0, 2'b00, op_luts[op], 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
+            configure_all(1'b0, 1'b0, 2'b00, 3'(op), 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
             
             for (int data = 0; data < 8; data++)
             begin
@@ -315,38 +302,7 @@ module CLB_unit_test;
                 #1ns;
                 `ifdef DEBUG_OP
                     $display("%b, %b, %b", my_CLB.input_a, my_CLB.input_b, my_CLB.input_c);
-                    $display("%b, %b, %b, %d, %b, %b", horz_bus_in, my_CLB.lut, my_CLB.lut_sel, exp_sum, exp_carry, my_CLB.carry);
-                `endif
-                `FAIL_UNLESS_EQUAL(exp_result, my_CLB.operation_result)
-                `FAIL_UNLESS_EQUAL(exp_carry, my_CLB.carry)
-            end
-        end
-    `SVTEST_END
-    
-    `SVTEST(test_lut_all_configs)
-        for (int lut = 0; lut < 256; lut++)
-        begin
-            configure_all(1'b0, 1'b0, 2'b00, 8'(lut), 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
-            lut_config = 8'(lut);
-            
-            #1ns;
-            
-            `FAIL_UNLESS_EQUAL(my_CLB.lut, lut_config)
-            
-            for (int data = 0; data < 8; data++)
-            begin
-                horz_bus_in = {1'b0, 3'(data)};
-                
-                #1ns;
-                
-                //input_a = horz_bus_in[0], input_b = horz_bus_in[1], input_c = horz_bus_in[2]
-                exp_result = lut_config[{horz_bus_in[0], horz_bus_in[1], horz_bus_in[2]}];
-                exp_sum = horz_bus_in[2] + horz_bus_in[1] + horz_bus_in[0];
-                exp_carry = exp_sum[1];
-                
-                #1ns;
-                `ifdef DEBUG_OP
-                    $display("%h, %b, %b, %b, %b, %b", lut_config, horz_bus_in, exp_result, my_CLB.operation_result, exp_carry, my_CLB.carry);
+                    $display("%b, %d, %d, %b, %b", horz_bus_in, exp_sum, my_CLB.full_sum_result, exp_carry, my_CLB.carry);
                 `endif
                 `FAIL_UNLESS_EQUAL(exp_result, my_CLB.operation_result)
                 `FAIL_UNLESS_EQUAL(exp_carry, my_CLB.carry)
@@ -357,7 +313,7 @@ module CLB_unit_test;
     `SVTEST(test_operation_ff)
         for (int val = 0; val < 2; val++)
         begin
-            configure_all(1'b1, 1'b1, 2'b00, 8'hE4, 2'b00, 4'b0000, 3'b000, 3'b000, 1'(val));
+            configure_all(1'b1, 1'b1, 2'b00, 3'b111, 2'b00, 4'b0000, 3'b000, 3'b000, 1'(val));
             
             //Testing synchronous reset
             reset = '1;
@@ -395,7 +351,7 @@ module CLB_unit_test;
     
     `SVTEST(test_horz_minor_muxes)
         //Test MUX0
-        configure_all(1'b1, 1'b1, 2'b01, 8'hFE, 2'b01, 4'b0000, 3'b000, 3'b000, 1'b0);
+        configure_all(1'b1, 1'b1, 2'b01, 3'b001, 2'b01, 4'b0000, 3'b000, 3'b000, 1'b0);
         
         for (int data = 0; data < 4; data++)
         begin
@@ -412,7 +368,7 @@ module CLB_unit_test;
         end
         
         //Test MUX1
-        configure_all(1'b0, 1'b1, 2'b01, 8'hFE, 2'b10, 4'b0000, 3'b000, 3'b000, 1'b0);
+        configure_all(1'b0, 1'b1, 2'b01, 3'b001, 2'b10, 4'b0000, 3'b000, 3'b000, 1'b0);
         
         for (int data = 0; data < 4; data++)
         begin
@@ -432,7 +388,7 @@ module CLB_unit_test;
     `SVTEST(test_vert_minor_muxes)
         for (logic [4:0] mux = 0; mux < 16; mux++)
         begin
-            configure_all(1'b0, 1'b0, 2'b00, 8'hFE, 2'b00, 4'(mux), 3'b000, 3'b000, 1'b0);
+            configure_all(1'b0, 1'b0, 2'b00, 3'b001, 2'b00, 4'(mux), 3'b000, 3'b000, 1'b0);
             
             //Setting operation_ff
             horz_bus_in[3] = '1;
@@ -457,7 +413,7 @@ module CLB_unit_test;
     `SVTEST(test_major_output_muxes)
         for (int mux = 0; mux < 8; mux++)
         begin
-            configure_all(1'b0, 1'b0, 2'b00, 8'h80, 2'b00, 4'b0000, 3'(mux), 3'(mux), 1'b0);
+            configure_all(1'b0, 1'b0, 2'b00, 3'b000, 2'b00, 4'b0000, 3'(mux), 3'(mux), 1'b0);
 
             for (logic [4:0] data = 0; data < 16; data++)
             begin
@@ -518,8 +474,7 @@ module CLB_unit_test;
     `SVTEST_END
 
     `SVTEST(test_carry_chain)
-        //LUT configured as XOR3 (full adder sum)
-        configure_all(1'b0, 1'b0, 2'b11, 8'h96, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
+        configure_all(1'b0, 1'b0, 2'b11, 3'b010, 2'b00, 4'b0000, 3'b000, 3'b000, 1'b0);
         
         for (logic [3:0] data = 0; data < 8; data++)
         begin

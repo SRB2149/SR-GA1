@@ -13,3 +13,4 @@ tb/equiv/*
 .svunit.f
 .testrunner.sv
 tests.xml
+*.wlf
