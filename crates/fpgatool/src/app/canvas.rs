@@ -49,10 +49,27 @@ fn right_io_x(fabric: &Fabric) -> f32 {
     col_x(fabric.columns - 1) + TILE_W + GAP_X
 }
 
-pub fn world_rect(fabric: &Fabric) -> Rect {
+/// How far below the CSB row a loop-around wire is routed. Each loop gets its
+/// own lane so several can run side by side without overlapping.
+const LOOP_LANE_H: f32 = 18.0;
+const LOOP_FIRST_LANE: f32 = 40.0;
+
+fn loop_lane_y(fabric: &Fabric, index: usize) -> f32 {
+    csb_y(fabric) + CSB_H + LOOP_FIRST_LANE + index as f32 * LOOP_LANE_H
+}
+
+/// The extent "zoom to fit" uses. Loop-around wires are routed around the
+/// outside of the grid, so the extent has to grow with them or they are drawn
+/// off-screen the moment the view is fitted.
+pub fn world_rect_with(fabric: &Fabric, loops: usize) -> Rect {
+    let bottom = if loops == 0 {
+        csb_y(fabric) + CSB_H + MARGIN
+    } else {
+        loop_lane_y(fabric, loops - 1) + MARGIN
+    };
     Rect::from_min_max(
         Pos2::new(0.0, 0.0),
-        Pos2::new(right_io_x(fabric) + IO_W + MARGIN, csb_y(fabric) + CSB_H + MARGIN),
+        Pos2::new(right_io_x(fabric) + IO_W + MARGIN, bottom),
     )
 }
 
@@ -80,7 +97,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
     let painter = ui.painter_at(avail);
     painter.rect_filled(avail, 0.0, Color32::from_gray(24));
 
-    let world = world_rect(&app.fabric);
+    let world = world_rect_with(&app.fabric, app.file.design.loopback().len());
     if app.fit_requested {
         app.fit_requested = false;
         let zoom = (avail.width() / world.width()).min(avail.height() / world.height()) * 0.96;
@@ -420,6 +437,80 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
             for w in pts.windows(2) {
                 painter.line_segment([to_screen(w[0]), to_screen(w[1])], stroke);
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Loop-around board wiring: a chip output tied back to a chip input.
+    //
+    // Routed around the outside rather than across the grid, one lane per loop,
+    // and drawn with the net's own identity colour and live value like any
+    // other wire — it carries a real signal. The arrowhead at the input end is
+    // the direction cue, matching the carry chain.
+    for (index, link) in app.file.design.loopback().iter().enumerate() {
+        let out_rect = io_rect(&app.fabric, false, link.from.row);
+        let in_rect = io_rect(&app.fabric, true, link.to.row);
+        let start = Pos2::new(
+            out_rect.max.x - 2.0,
+            lane_y(&app.fabric, out_rect.min.y, link.from.lane),
+        );
+        let end = Pos2::new(
+            in_rect.min.x - 2.0,
+            lane_y(&app.fabric, in_rect.min.y, link.to.lane),
+        );
+        let y = loop_lane_y(&app.fabric, index);
+        let out_x = start.x + 14.0 + index as f32 * 6.0;
+        let in_x = end.x - 14.0 - index as f32 * 6.0;
+
+        // The net is the one arriving at the driving output pad.
+        let origin = app.nets.horz_edge(link.from.row, link.from.lane);
+        let (color, _name, dim) = wire_color(app, origin);
+        let value = settled.map(|s| s.horz_edge(link.from.row, link.from.lane));
+
+        let pts = [
+            start,
+            Pos2::new(out_x, start.y),
+            Pos2::new(out_x, y),
+            Pos2::new(in_x, y),
+            Pos2::new(in_x, end.y),
+            end,
+        ];
+        for w in pts.windows(2) {
+            draw_wire(&painter, w[0], w[1], color, value, dim);
+        }
+
+        // Arrowhead into the input pad.
+        if zoom > 0.35 {
+            let s = 5.0;
+            let tip = end;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    to_screen(tip),
+                    to_screen(Pos2::new(tip.x - 1.6 * s, tip.y - s)),
+                    to_screen(Pos2::new(tip.x - 1.6 * s, tip.y + s)),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        if seg_labels {
+            let from_name = app
+                .file
+                .design
+                .effective_io_name(&app.fabric, link.from)
+                .unwrap_or_default();
+            let to_name = app
+                .file
+                .design
+                .effective_io_name(&app.fabric, link.to)
+                .unwrap_or_default();
+            painter.text(
+                to_screen(Pos2::new((out_x + in_x) * 0.5, y - 9.0)),
+                Align2::CENTER_CENTER,
+                format!("board: {} → {}", from_name, to_name),
+                small_font.clone(),
+                Color32::from_gray(150),
+            );
         }
     }
 

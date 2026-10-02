@@ -15,7 +15,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Some(BlockId::Csb { col }) => csb_inspector(app, ui, col),
             None => {
                 if let Some((input_side, row)) = app.io_selected {
-                    io_inspector(app, ui, input_side, row);
+                    super::io_panel::show(app, ui, input_side, row);
                 }
             }
         }
@@ -59,7 +59,7 @@ fn source_label(app: &App, col: usize, row: usize, src: Source) -> String {
     }
 }
 
-fn trace_button(app: &mut App, ui: &mut egui::Ui, id: String, label: &str) {
+pub(super) fn trace_button(app: &mut App, ui: &mut egui::Ui, id: String, label: &str) {
     let on = app.is_traced(&id);
     if ui
         .selectable_label(on, format!("{} {}", if on { "◉" } else { "○" }, label))
@@ -400,64 +400,6 @@ fn csb_inspector(app: &mut App, ui: &mut egui::Ui, col: usize) {
 }
 
 // ---------------------------------------------------------------------------
-
-fn io_inspector(app: &mut App, ui: &mut egui::Ui, input_side: bool, row: usize) {
-    ui.heading(if input_side {
-        format!("input controller — row {}", row)
-    } else {
-        format!("output controller — row {}", row)
-    });
-    ui.label("IO controllers hold no configuration bits.");
-    ui.separator();
-    for lane in (0..app.fabric.horz_lanes).rev() {
-        let name = if input_side {
-            Some(app.fabric.io_inputs[row][lane].clone())
-        } else {
-            app.fabric.io_outputs[row][lane].clone()
-        };
-        ui.horizontal(|ui| {
-            ui.monospace(format!("{}:", lane));
-            match name {
-                Some(name) => {
-                    let constant = name == app.fabric.naming.constant_zero || name == app.fabric.naming.constant_one;
-                    ui.colored_label(
-                        if constant { colors::DIM } else { colors::name_color(&name, None) },
-                        &name,
-                    );
-                    if let Some(s) = app.sim.as_ref().and_then(|s| s.settled.as_ref()) {
-                        let v = if input_side { s.horz_in(0, row, lane) } else { s.horz_edge(row, lane) };
-                        ui.label(egui::RichText::new(if v { "1" } else { "0" }).color(colors::value_fill(v)).monospace());
-                    }
-                    if !constant {
-                        let id = format!("{}:{}", if input_side { "in" } else { "out" }, name);
-                        trace_button(app, ui, id, "trace");
-                    }
-                }
-                None => {
-                    ui.colored_label(colors::DIM, "— unused");
-                }
-            }
-        });
-    }
-    if !app.fabric.ddio.is_empty() {
-        ui.separator();
-        for d in &app.fabric.ddio {
-            ui.label(
-                egui::RichText::new(format!("{} is forced 0 while {} = 1 (pad direction)", d.input, d.dir))
-                    .small()
-                    .color(Color32::from_gray(120)),
-            );
-        }
-    }
-    if input_side {
-        ui.separator();
-        ui.label(
-            egui::RichText::new("drive these pins from the stimulus panel below")
-                .small()
-                .color(Color32::from_gray(120)),
-        );
-    }
-}
 
 // ---------------------------------------------------------------------------
 

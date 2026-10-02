@@ -13,7 +13,7 @@
 //! [`Netlist`] stays valid across renames: display names are produced by
 //! [`Namer`] at render time, which applies pinned names automatically.
 
-use crate::config::{default_name, BlockId, Design};
+use crate::config::{default_name, BlockId, Design, IoPad};
 use crate::fabric::{BusOut, CarryChain, Fabric, Source};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -324,7 +324,14 @@ impl<'a> Namer<'a> {
 
     pub fn net_name(&self, origin: NetOrigin) -> String {
         match origin {
-            NetOrigin::Io { row, lane } => self.fabric.io_inputs[row][lane].clone(),
+            // An input pad is where a net begins, so the design's name for the
+            // pad *is* the net's name and every segment carrying it follows.
+            // An output pad is different: the net arriving there is named after
+            // whatever drives it, and the pad name is only a label on the pad.
+            NetOrigin::Io { row, lane } => self
+                .design
+                .effective_io_name(self.fabric, IoPad::input(row, lane))
+                .unwrap_or_else(|| self.fabric.io_inputs[row][lane].clone()),
             NetOrigin::Const(false) => self.fabric.naming.constant_zero.clone(),
             NetOrigin::Const(true) => self.fabric.naming.constant_one.clone(),
             NetOrigin::ClbOutput { col, row, kind } => {

@@ -32,7 +32,10 @@ fn options(source: &str, top: &str, tag: &str, seed: u64) -> Options {
         top: top.to_string(),
         fabric: repo_root().join("fabric.toml"),
         effort: Effort::Medium,
-        time_budget: Duration::from_secs(30),
+        // A ceiling, not a target: these designs normally fit on the first
+        // attempt in well under a second. Generous enough that a busy machine
+        // running several test binaries at once does not fail spuriously.
+        time_budget: Duration::from_secs(120),
         seed,
         check_only: false,
         keep_intermediates: false,

@@ -133,15 +133,17 @@ fn main() -> ExitCode {
                 let used = check.packed.clb_count();
                 let capacity = check.fabric.clb_count();
                 println!(
-                    "{}: {} CLBs of {} before placement ({} register(s), {} unconditional)",
+                    "{}: {} CLBs of {} before placement ({}) — {} register(s) ({}), {} unconditional",
                     check.packed.top,
                     used,
                     capacity,
+                    report::share(used, capacity),
                     check.packed.register_count(),
+                    report::share(check.packed.register_count(), capacity),
                     check.packed.always_enabled()
                 );
                 for (gate, count) in check.packed.gate_histogram() {
-                    println!("  {:<10} {}", gate, count);
+                    println!("  {:<10} {:>4} {:>8} of mapped logic", gate, count, report::share(count, used));
                 }
                 println!(
                     "  routing buffers and clock buffering are not counted here; the placed \
@@ -275,8 +277,7 @@ fn main() -> ExitCode {
         for link in &wiring {
             eprintln!("    {} -> {}", link.from, link.to);
         }
-        eprintln!("The visual programmer cannot model board wiring, so its simulation of");
-        eprintln!("this design will not match the hardware.");
+        eprintln!("These wires must be present on the board for the configuration to work.");
     }
     ExitCode::SUCCESS
 }

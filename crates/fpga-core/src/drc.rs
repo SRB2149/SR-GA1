@@ -15,7 +15,7 @@
 //!   reproduce (info, naming the signal);
 //! - blocks that neither originate nor repeat any live signal (info).
 
-use crate::config::{BlockId, Design};
+use crate::config::{BlockId, Design, IoPad};
 use crate::fabric::{BusOut, Fabric, Source};
 use crate::naming::{resolve, Namer, NetOrigin};
 
@@ -132,15 +132,38 @@ pub fn check(fabric: &Fabric, design: &Design) -> Vec<DrcItem> {
         }
     }
 
-    // Potential combinational loops (through logic or the DDIO gate).
+    // Potential combinational loops (through logic, the DDIO gate, or a
+    // loop-around board wire).
     for blocks in combinational_loops(fabric, design) {
         let names: Vec<String> = blocks.iter().map(|&b| namer.block_name(b)).collect();
+        // A cycle closed only through board wiring passes through no block, so
+        // there is nothing to list; name the wiring instead.
+        let through = if names.is_empty() {
+            let wires: Vec<String> = design
+                .loopback()
+                .iter()
+                .map(|l| {
+                    format!(
+                        "{} -> {}",
+                        design
+                            .effective_io_name(fabric, l.from)
+                            .unwrap_or_else(|| "?".to_string()),
+                        design
+                            .effective_io_name(fabric, l.to)
+                            .unwrap_or_else(|| "?".to_string())
+                    )
+                })
+                .collect();
+            format!("loop-around wiring ({})", wires.join(", "))
+        } else {
+            names.join(", ")
+        };
         items.push(DrcItem {
             severity: Severity::Error,
             block: blocks.first().copied(),
             message: format!(
                 "potential combinational loop through: {} — simulation will refuse to settle if it oscillates",
-                names.join(", ")
+                through
             ),
         });
     }
@@ -263,6 +286,16 @@ fn liveness(fabric: &Fabric, design: &Design) -> Liveness {
                             if let Some((dr, dl)) = out_pos(fabric, &d.dir) {
                                 work.push(Demand::Seg(Seg::Horz { row: dr, lane: dl, pos: columns }));
                             }
+                        }
+                        // A looped input depends on the output the board wires
+                        // to it; without this, logic feeding a loop reads as
+                        // dead and gets reported as unused.
+                        if let Some(driver) = design.loopback_driver(IoPad::input(row, lane)) {
+                            work.push(Demand::Seg(Seg::Horz {
+                                row: driver.row,
+                                lane: driver.lane,
+                                pos: columns,
+                            }));
                         }
                     }
                     Seg::Horz { row, lane, pos } => {
@@ -408,9 +441,15 @@ pub fn combinational_loops(fabric: &Fabric, design: &Design) -> Vec<Vec<BlockId>
     // Dependency edges, each annotated with the CLB it passes through (None
     // for plain pass-through / gate edges) and whether it goes through logic
     // or a gate rather than a wire.
+    //
+    // `loopback` marks a board wire from a chip output back to a chip input.
+    // Such a wire is honestly not logic, but a cycle closed through one is a
+    // real driverless oscillation, so it makes a cycle reportable in the same
+    // way a logic edge does.
     struct Edge {
         to: usize,
         through_logic: bool,
+        loopback: bool,
         block: Option<BlockId>,
     }
     let mut edges: Vec<Vec<Edge>> = (0..n_h + n_v).map(|_| Vec::new()).collect();
@@ -423,11 +462,13 @@ pub fn combinational_loops(fabric: &Fabric, design: &Design) -> Vec<Vec<BlockId>
         Source::HorzIn(k) => edges[from].push(Edge {
             to: idx(Seg::Horz { row, lane: k, pos: col }),
             through_logic: false,
+            loopback: false,
             block: Some(BlockId::Clb { col, row }),
         }),
         Source::VertIn(k) => edges[from].push(Edge {
             to: idx(Seg::Vert { col, lane: k, pos: row }),
             through_logic: false,
+            loopback: false,
             block: Some(BlockId::Clb { col, row }),
         }),
         Source::Op | Source::Carry => {
@@ -451,6 +492,7 @@ pub fn combinational_loops(fabric: &Fabric, design: &Design) -> Vec<Vec<BlockId>
                         edges[from].push(Edge {
                             to,
                             through_logic: true,
+                            loopback: false,
                             block: Some(BlockId::Clb { col, row: r }),
                         });
                     }
@@ -478,9 +520,20 @@ pub fn combinational_loops(fabric: &Fabric, design: &Design) -> Vec<Vec<BlockId>
                     edges[from].push(Edge {
                         to: idx(Seg::Horz { row: dr, lane: dl, pos: columns }),
                         through_logic: true,
+                        loopback: false,
                         block: None,
                     });
                 }
+            }
+            // A board wire makes this input depend on the output it is tied to.
+            if let Some(driver) = design.loopback_driver(IoPad::input(row, lane)) {
+                let from = idx(Seg::Horz { row, lane, pos: 0 });
+                edges[from].push(Edge {
+                    to: idx(Seg::Horz { row: driver.row, lane: driver.lane, pos: columns }),
+                    through_logic: false,
+                    loopback: true,
+                    block: None,
+                });
             }
             for pos in 1..=columns {
                 let col = pos - 1;
@@ -539,7 +592,7 @@ pub fn combinational_loops(fabric: &Fabric, design: &Design) -> Vec<Vec<BlockId>
                         let mut has_logic = false;
                         for (pn, pe) in cycle_edges {
                             let edge = &edges[pn][pe];
-                            has_logic |= edge.through_logic;
+                            has_logic |= edge.through_logic || edge.loopback;
                             if let Some(b) = edge.block {
                                 if !blocks.contains(&b) {
                                     blocks.push(b);

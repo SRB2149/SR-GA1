@@ -33,12 +33,12 @@ pub type Stimulus = BTreeMap<String, Vec<u8>>;
 
 /// One loop-around board wire the configuration depends on.
 ///
-/// This is an extension to the format the visual programmer writes. It is the
-/// last field and is omitted when empty, so a design with no loop-around wiring
-/// still round-trips byte-for-byte against the GUI's own exports — which is what
-/// the golden tests check. The GUI ignores unknown fields, so it will load a
-/// file that has this section, but it neither simulates the wiring nor preserves
-/// the field when saving. See `docs/gui-loopback-support.md`.
+/// This is an extension to the format the visual programmer originally wrote. It
+/// is the last field and is omitted when empty, so a design with no loop-around
+/// wiring still round-trips byte-for-byte against the GUI's own exports — which
+/// is what the golden tests check. `fpga_core::designfile::LoopbackLink` matches
+/// this field-for-field, so the GUI loads, draws, simulates and re-saves the
+/// wiring. See `docs/loop-around.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopbackLink {
     /// Chip output pad the wire starts at.

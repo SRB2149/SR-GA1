@@ -44,7 +44,8 @@ fn options(source: &str, top: &str, tag: &str, constraints: Option<&str>) -> Opt
         top: top.to_string(),
         fabric: repo_root().join("fabric.toml"),
         effort: Effort::Medium,
-        time_budget: Duration::from_secs(40),
+        // A ceiling, not a target; see the note in tests/synthesis.rs.
+        time_budget: Duration::from_secs(120),
         seed: 0,
         check_only: false,
         keep_intermediates: false,

@@ -3,7 +3,7 @@
 //! different fabric produces clear warnings (or an error when the grid no
 //! longer fits) instead of silently misconfiguring.
 
-use crate::config::{BlockId, Design};
+use crate::config::{BlockId, Design, IoPad};
 use crate::fabric::Fabric;
 use crate::sim::Stimulus;
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,27 @@ struct FileSchema {
     traces: Vec<String>,
     #[serde(default)]
     view: Option<serde_json::Value>,
+    /// Loop-around board wiring: a chip output physically tied to a chip input.
+    /// Last, and omitted when empty, so a design without any is byte-identical
+    /// to the format before this existed. Matches the schema `sr-ga1-synth`
+    /// writes, so files round-trip between the two tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    loopback: Vec<LoopbackLink>,
+    /// Chip pad -> the design's name for the signal on it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    io_names: BTreeMap<String, String>,
+}
+
+/// One loop-around wire, named by pad rather than by coordinates so the file
+/// reads the same way the synthesiser's reports and the board do.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+struct LoopbackLink {
+    from: String,
+    to: String,
+    /// The net being carried, for readability. Written by the synthesiser;
+    /// ignored on load.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    net: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]
@@ -152,6 +173,23 @@ pub fn save_design(fabric: &Fabric, file: &DesignFile) -> String {
         tick: file.tick,
         traces: file.traces.clone(),
         view: file.view.clone(),
+        loopback: file
+            .design
+            .loopback()
+            .iter()
+            .filter_map(|l| {
+                Some(LoopbackLink {
+                    from: l.from.reserved_name(fabric)?,
+                    to: l.to.reserved_name(fabric)?,
+                    net: String::new(),
+                })
+            })
+            .collect(),
+        io_names: file
+            .design
+            .io_names()
+            .filter_map(|(pad, name)| Some((pad.reserved_name(fabric)?, name.to_string())))
+            .collect(),
     };
     // BTreeMaps and struct order make this deterministic; serialization of
     // plain data cannot fail.
@@ -262,6 +300,39 @@ pub fn load_design(fabric: &Fabric, src: &str) -> Result<(DesignFile, Vec<String
         }
     }
 
+    // Pad names and board wiring. Both are addressed by the fabric's reserved
+    // pad names, so an entry naming a pad this fabric does not have is a
+    // warning rather than a failure, like a stale pinned name.
+    for (pad_name, name) in &schema.io_names {
+        match find_pad(fabric, pad_name) {
+            Some(pad) => {
+                if let Err(e) = design.rename_io(fabric, pad, name) {
+                    warnings.push(format!("could not restore the name \"{}\": {}", name, e));
+                }
+            }
+            None => warnings.push(format!(
+                "ignoring the name \"{}\": this fabric has no pad \"{}\"",
+                name, pad_name
+            )),
+        }
+    }
+    for link in &schema.loopback {
+        match (find_pad(fabric, &link.from), find_pad(fabric, &link.to)) {
+            (Some(from), Some(to)) => {
+                if let Err(e) = design.set_loopback(fabric, from, to) {
+                    warnings.push(format!(
+                        "could not restore the loop {} -> {}: {}",
+                        link.from, link.to, e
+                    ));
+                }
+            }
+            _ => warnings.push(format!(
+                "ignoring the loop {} -> {}: this fabric has no such pad",
+                link.from, link.to
+            )),
+        }
+    }
+
     let mut stimulus = Stimulus::default();
     for (name, pattern) in &schema.stimulus {
         stimulus.set(name, pattern.iter().map(|&v| v != 0).collect());
@@ -278,6 +349,27 @@ pub fn load_design(fabric: &Fabric, src: &str) -> Result<(DesignFile, Vec<String
         },
         warnings,
     ))
+}
+
+/// Find a pad by the fabric's reserved name. Outputs are searched first so a
+/// name appearing on both sides resolves to the output, which is the direction a
+/// loop's `from` always means.
+fn find_pad(fabric: &crate::fabric::Fabric, name: &str) -> Option<IoPad> {
+    for (row, lanes) in fabric.io_outputs.iter().enumerate() {
+        for (lane, pad) in lanes.iter().enumerate() {
+            if pad.as_deref() == Some(name) {
+                return Some(IoPad::output(row, lane));
+            }
+        }
+    }
+    for (row, lanes) in fabric.io_inputs.iter().enumerate() {
+        for (lane, pad) in lanes.iter().enumerate() {
+            if pad == name {
+                return Some(IoPad::input(row, lane));
+            }
+        }
+    }
+    None
 }
 
 fn parse_pair(key: &str) -> Option<(usize, usize)> {

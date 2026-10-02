@@ -3,13 +3,14 @@
 //! and simulation panel live in the sibling modules.
 
 mod canvas;
+mod io_panel;
 pub mod colors;
 mod inspector;
 mod simpanel;
 
 use eframe::egui;
 use fpga_core::bitstream;
-use fpga_core::config::{BlockId, CellConfig, Design};
+use fpga_core::config::{BlockId, CellConfig, Design, IoPad};
 use fpga_core::designfile::{load_design, save_design, DesignFile};
 use fpga_core::drc::{self, DrcItem, Severity};
 use fpga_core::fabric::Fabric;
@@ -127,6 +128,11 @@ pub struct App {
     pub last_autosave: f64,
 
     pub rename_buf: String,
+    /// Per-pad name edit buffers, keyed by `io_panel::buf_key`. One shared
+    /// buffer cannot work here: four lanes are on screen at once.
+    pub io_name_bufs: HashMap<String, String>,
+    pub io_rename_err: Option<String>,
+    pub io_rename_pad: Option<IoPad>,
     pub rename_err: Option<String>,
     pub stim_bufs: HashMap<String, String>,
     pub wrap_export: bool,
@@ -163,6 +169,9 @@ impl App {
             toasts: Vec::new(),
             last_autosave: 0.0,
             rename_buf: String::new(),
+            io_name_bufs: HashMap::new(),
+            io_rename_err: None,
+            io_rename_pad: None,
             rename_err: None,
             stim_bufs: HashMap::new(),
             wrap_export: false,
@@ -359,6 +368,90 @@ impl App {
 
     // ------------------------------------------------------------------
     // Files
+
+    /// Give a chip pad the design's own name for the signal on it. Undoable,
+    /// like a block rename, with the error shown beside the field.
+    pub fn try_rename_io(&mut self, pad: IoPad, name: &str) {
+        let mut next = self.file.design.clone();
+        match next.rename_io(&self.fabric, pad, name) {
+            Ok(()) => {
+                self.io_rename_err = None;
+                self.io_rename_pad = None;
+                self.undo_stack.push(("rename pad".to_string(), self.file.design.clone()));
+                if self.undo_stack.len() > 300 {
+                    self.undo_stack.remove(0);
+                }
+                self.redo_stack.clear();
+                self.file.design = next;
+                self.after_design_change();
+                // Re-prime the buffer from what was actually stored, so a
+                // trimmed name shows as stored rather than as typed.
+                let shown = self
+                    .file
+                    .design
+                    .effective_io_name(&self.fabric, pad)
+                    .unwrap_or_default();
+                self.io_name_bufs.insert(io_panel::buf_key(pad), shown);
+            }
+            Err(e) => {
+                self.io_rename_err = Some(e.to_string());
+                self.io_rename_pad = Some(pad);
+            }
+        }
+    }
+
+    /// Wire a chip output back to a chip input on the board.
+    pub fn set_loopback(&mut self, from: IoPad, to: IoPad) {
+        let fabric = &self.fabric;
+        let mut next = self.file.design.clone();
+        match next.set_loopback(fabric, from, to) {
+            Ok(()) => {
+                self.undo_stack.push(("add loop".to_string(), self.file.design.clone()));
+                if self.undo_stack.len() > 300 {
+                    self.undo_stack.remove(0);
+                }
+                self.redo_stack.clear();
+                self.file.design = next;
+                self.after_design_change();
+            }
+            Err(e) => self.toast(e.to_string()),
+        }
+    }
+
+    /// The design's name for a pad, given the fabric's reserved name for it.
+    /// Falls back to the reserved name, which is what an unnamed pad shows.
+    pub fn pad_display_name(&self, reserved: &str) -> String {
+        for row in 0..self.fabric.rows {
+            for lane in 0..self.fabric.horz_lanes {
+                if self.fabric.io_inputs[row][lane] == reserved {
+                    if let Some(name) = self.file.design.io_name(IoPad::input(row, lane)) {
+                        return name.to_string();
+                    }
+                }
+                if self.fabric.io_outputs[row][lane].as_deref() == Some(reserved) {
+                    if let Some(name) = self.file.design.io_name(IoPad::output(row, lane)) {
+                        return name.to_string();
+                    }
+                }
+            }
+        }
+        reserved.to_string()
+    }
+
+    /// Whether the board drives this input pad, so stimulus cannot.
+    pub fn input_is_driven(&self, name: &str) -> Option<String> {
+        for row in 0..self.fabric.rows {
+            for lane in 0..self.fabric.horz_lanes {
+                if self.fabric.io_inputs[row][lane] != name {
+                    continue;
+                }
+                if let Some(from) = self.file.design.loopback_driver(IoPad::input(row, lane)) {
+                    return self.file.design.effective_io_name(&self.fabric, from);
+                }
+            }
+        }
+        None
+    }
 
     pub fn toast(&mut self, msg: String) {
         self.toasts.push((msg, 0.0));

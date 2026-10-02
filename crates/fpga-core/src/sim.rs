@@ -16,7 +16,7 @@
 //! feedback in this fabric) are detected and reported with the blocks
 //! involved, never hung on.
 
-use crate::config::{BlockId, Design};
+use crate::config::{BlockId, Design, IoPad};
 use crate::fabric::{BusOut, CarryChain, Fabric, Source};
 use std::collections::HashMap;
 
@@ -232,6 +232,11 @@ enum LeftPin {
     /// A stimulus input, optionally gated off when the named DDIO direction
     /// output (at the right edge) is 1.
     Stim { name: String, gate: Option<(usize, usize)> },
+    /// A board wire from a chip output back to this input. Read from the same
+    /// right-edge slot the DDIO gate reads, and evaluated inside the settle
+    /// sweep, so the value propagates round exactly as the wire does and a loop
+    /// that will not settle is reported like any other combinational loop.
+    Loop { from: (usize, usize), gate: Option<(usize, usize)> },
 }
 
 fn settle(
@@ -279,7 +284,13 @@ fn settle(
                     .iter()
                     .find(|d| d.input == *name)
                     .and_then(|d| dir_pos(&d.dir));
-                LeftPin::Stim { name: name.clone(), gate }
+                // A looped input is driven by the board, not by stimulus. The
+                // DDIO gate still applies: such a pad is only an input while its
+                // direction bit is low.
+                match design.loopback_driver(IoPad::input(row, lane)) {
+                    Some(from) => LeftPin::Loop { from: (from.row, from.lane), gate },
+                    None => LeftPin::Stim { name: name.clone(), gate },
+                }
             });
         }
     }
@@ -320,6 +331,15 @@ fn settle(
                     LeftPin::Const(b) => *b,
                     LeftPin::Stim { name, gate } => {
                         let mut x = stimulus.value_at(name, tick);
+                        if let Some((dr, dl)) = gate {
+                            if h[hidx(*dr, *dl, columns)] {
+                                x = false;
+                            }
+                        }
+                        x
+                    }
+                    LeftPin::Loop { from, gate } => {
+                        let mut x = h[hidx(from.0, from.1, columns)];
                         if let Some((dr, dl)) = gate {
                             if h[hidx(*dr, *dl, columns)] {
                                 x = false;

@@ -193,6 +193,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             }
         }
         for name in names {
+            // Read everything needing `&app` before taking the mutable buffer
+            // borrow: the closure below relies on disjoint field capture, which
+            // a whole-`App` borrow would defeat.
+            let driven_by = app.input_is_driven(&name);
+            let label = app.pad_display_name(&name);
+            let live = app.sim.as_ref().map(|sim| match (&driven_by, sim.settled.as_ref()) {
+                // A looped pin carries the settled value, not its stimulus.
+                (Some(_), Some(settled)) => pin_value(app, settled, &name),
+                _ => app.file.stimulus.value_at(&name, sim.state.tick),
+            });
             let buf = app
                 .stim_bufs
                 .entry(name.clone())
@@ -201,22 +211,46 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     None => "0".to_string(),
                 });
             let mut text = buf.clone();
+            // A looped input is driven by the board, not by stimulus: offering
+            // an editable field would let the user type a value and watch it be
+            // ignored. Patterns stay keyed by the fabric's reserved pad name so
+            // a rename can never orphan one; the label shows the design's name.
             ui.horizontal(|ui| {
-                ui.monospace(format!("{:10}", name));
-                let valid = text.chars().all(|c| c == '0' || c == '1');
-                let edit = egui::TextEdit::singleline(&mut text)
-                    .desired_width(220.0)
-                    .text_color(if valid { egui::Color32::from_gray(220) } else { egui::Color32::LIGHT_RED });
-                if ui.add(edit).changed() {
-                    *buf = text.clone();
-                    if valid {
-                        let pattern: Vec<bool> = text.chars().map(|c| c == '1').collect();
-                        app.file.stimulus.set(&name, pattern);
-                        app.dirty = true;
+                ui.monospace(format!("{:10}", label));
+                match &driven_by {
+                    Some(from) => {
+                        ui.add_enabled_ui(false, |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut text.clone())
+                                    .desired_width(220.0),
+                            );
+                        });
+                        ui.label(
+                            egui::RichText::new(format!("driven by {} (board wiring)", from))
+                                .small()
+                                .color(egui::Color32::from_gray(150)),
+                        );
+                    }
+                    None => {
+                        let valid = text.chars().all(|c| c == '0' || c == '1');
+                        let edit = egui::TextEdit::singleline(&mut text)
+                            .desired_width(220.0)
+                            .text_color(if valid {
+                                egui::Color32::from_gray(220)
+                            } else {
+                                egui::Color32::LIGHT_RED
+                            });
+                        if ui.add(edit).changed() {
+                            *buf = text.clone();
+                            if valid {
+                                let pattern: Vec<bool> = text.chars().map(|c| c == '1').collect();
+                                app.file.stimulus.set(&name, pattern);
+                                app.dirty = true;
+                            }
+                        }
                     }
                 }
-                if let Some(sim) = &app.sim {
-                    let v = app.file.stimulus.value_at(&name, sim.state.tick);
+                if let Some(v) = live {
                     ui.label(
                         egui::RichText::new(if v { "1" } else { "0" })
                             .color(super::colors::value_fill(v))
@@ -232,11 +266,25 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+/// What a named input pin is actually carrying in the settled state.
+fn pin_value(app: &App, settled: &fpga_core::sim::Settled, name: &str) -> bool {
+    for row in 0..app.fabric.rows {
+        for lane in 0..app.fabric.horz_lanes {
+            if app.fabric.io_inputs[row][lane] == name {
+                return settled.horz_in(0, row, lane);
+            }
+        }
+    }
+    false
+}
+
 fn trace_display_name(app: &App, id: &str) -> String {
     let parts: Vec<&str> = id.split(':').collect();
     let num = |s: &str| s.parse::<usize>().unwrap_or(0);
     match parts.as_slice() {
-        ["in", name] | ["out", name] => name.to_string(),
+        // Traces are keyed by the reserved pad name, but the waveform should
+        // read as the design's name for it.
+        ["in", name] | ["out", name] => app.pad_display_name(name),
         ["clk", col] => app.clock_label(num(col)),
         ["ff", col, row] => format!(
             "{}{}",
