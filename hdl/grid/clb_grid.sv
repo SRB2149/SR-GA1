@@ -28,7 +28,7 @@
 
 module CLB_Grid #(
     parameter int ROWS    = 4,
-    parameter int COLUMNS = 7
+    parameter int COLUMNS = 8
 )(
     // Programming interface
     input   logic       shift_clk,
