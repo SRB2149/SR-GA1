@@ -17,7 +17,7 @@ module SR_GA1 (
     output  logic [1:0] ddio_out
 );
 
-    localparam COLUMNS = 7;
+    localparam COLUMNS = 8;
     // Rows are fixed from an easily configurable perspective.
     // The IO controller will need to be edited to add more rows.
     
