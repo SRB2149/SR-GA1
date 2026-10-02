@@ -1,0 +1,326 @@
+VERSION 5.7 ;
+  NOWIREEXTENSIONATPIN ON ;
+  DIVIDERCHAR "/" ;
+  BUSBITCHARS "[]" ;
+MACRO CLB
+  CLASS BLOCK ;
+  FOREIGN CLB ;
+  ORIGIN 0.000 0.000 ;
+  SIZE 35.420 BY 48.960 ;
+  PIN VGND
+    DIRECTION INOUT ;
+    USE GROUND ;
+    PORT
+      LAYER met2 ;
+        RECT 8.440 2.480 10.040 46.480 ;
+    END
+    PORT
+      LAYER met2 ;
+        RECT 28.740 2.480 30.340 46.480 ;
+    END
+    PORT
+      LAYER met3 ;
+        RECT 1.600 24.220 33.820 25.820 ;
+    END
+  END VGND
+  PIN VPWR
+    DIRECTION INOUT ;
+    USE POWER ;
+    PORT
+      LAYER met2 ;
+        RECT 5.140 2.480 6.740 46.480 ;
+    END
+    PORT
+      LAYER met2 ;
+        RECT 25.440 2.480 27.040 46.480 ;
+    END
+    PORT
+      LAYER met3 ;
+        RECT 1.600 20.920 33.820 22.520 ;
+    END
+  END VPWR
+  PIN carry_in
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.196500 ;
+    PORT
+      LAYER met2 ;
+        RECT 32.750 0.000 33.030 4.000 ;
+    END
+  END carry_in
+  PIN carry_out
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.445500 ;
+    PORT
+      LAYER met2 ;
+        RECT 32.750 44.960 33.030 48.960 ;
+    END
+  END carry_out
+  PIN clk
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.852000 ;
+    PORT
+      LAYER met2 ;
+        RECT 22.630 0.000 22.910 4.000 ;
+    END
+  END clk
+  PIN clk_out
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.340600 ;
+    PORT
+      LAYER met2 ;
+        RECT 22.630 44.960 22.910 48.960 ;
+    END
+  END clk_out
+  PIN horz_bus_in[0]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.196500 ;
+    PORT
+      LAYER met3 ;
+        RECT 0.000 2.760 4.000 3.360 ;
+    END
+  END horz_bus_in[0]
+  PIN horz_bus_in[1]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.196500 ;
+    PORT
+      LAYER met3 ;
+        RECT 0.000 10.920 4.000 11.520 ;
+    END
+  END horz_bus_in[1]
+  PIN horz_bus_in[2]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.196500 ;
+    PORT
+      LAYER met3 ;
+        RECT 0.000 19.080 4.000 19.680 ;
+    END
+  END horz_bus_in[2]
+  PIN horz_bus_in[3]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.196500 ;
+    PORT
+      LAYER met3 ;
+        RECT 0.000 27.240 4.000 27.840 ;
+    END
+  END horz_bus_in[3]
+  PIN horz_bus_out[0]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.445500 ;
+    PORT
+      LAYER met3 ;
+        RECT 31.420 2.760 35.420 3.360 ;
+    END
+  END horz_bus_out[0]
+  PIN horz_bus_out[1]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.445500 ;
+    PORT
+      LAYER met3 ;
+        RECT 31.420 10.920 35.420 11.520 ;
+    END
+  END horz_bus_out[1]
+  PIN horz_bus_out[2]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.445500 ;
+    PORT
+      LAYER met3 ;
+        RECT 31.420 19.080 35.420 19.680 ;
+    END
+  END horz_bus_out[2]
+  PIN horz_bus_out[3]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.445500 ;
+    PORT
+      LAYER met3 ;
+        RECT 31.420 27.240 35.420 27.840 ;
+    END
+  END horz_bus_out[3]
+  PIN reset
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.196500 ;
+    PORT
+      LAYER met2 ;
+        RECT 27.690 0.000 27.970 4.000 ;
+    END
+  END reset
+  PIN reset_out
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.445500 ;
+    PORT
+      LAYER met2 ;
+        RECT 27.690 44.960 27.970 48.960 ;
+    END
+  END reset_out
+  PIN shift_clk
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.196500 ;
+    PORT
+      LAYER met3 ;
+        RECT 0.000 43.560 4.000 44.160 ;
+    END
+  END shift_clk
+  PIN shift_clk_out
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.445500 ;
+    PORT
+      LAYER met3 ;
+        RECT 31.420 43.560 35.420 44.160 ;
+    END
+  END shift_clk_out
+  PIN shift_data_in
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.196500 ;
+    PORT
+      LAYER met3 ;
+        RECT 0.000 35.400 4.000 36.000 ;
+    END
+  END shift_data_in
+  PIN shift_data_out
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.445500 ;
+    PORT
+      LAYER met3 ;
+        RECT 31.420 35.400 35.420 36.000 ;
+    END
+  END shift_data_out
+  PIN vert_bus_in[0]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.196500 ;
+    PORT
+      LAYER met2 ;
+        RECT 2.390 0.000 2.670 4.000 ;
+    END
+  END vert_bus_in[0]
+  PIN vert_bus_in[1]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.196500 ;
+    PORT
+      LAYER met2 ;
+        RECT 7.450 0.000 7.730 4.000 ;
+    END
+  END vert_bus_in[1]
+  PIN vert_bus_in[2]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.196500 ;
+    PORT
+      LAYER met2 ;
+        RECT 12.510 0.000 12.790 4.000 ;
+    END
+  END vert_bus_in[2]
+  PIN vert_bus_in[3]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    ANTENNAGATEAREA 0.196500 ;
+    PORT
+      LAYER met2 ;
+        RECT 17.570 0.000 17.850 4.000 ;
+    END
+  END vert_bus_in[3]
+  PIN vert_bus_out[0]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.445500 ;
+    PORT
+      LAYER met2 ;
+        RECT 2.390 44.960 2.670 48.960 ;
+    END
+  END vert_bus_out[0]
+  PIN vert_bus_out[1]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.445500 ;
+    PORT
+      LAYER met2 ;
+        RECT 7.450 44.960 7.730 48.960 ;
+    END
+  END vert_bus_out[1]
+  PIN vert_bus_out[2]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.445500 ;
+    PORT
+      LAYER met2 ;
+        RECT 12.510 44.960 12.790 48.960 ;
+    END
+  END vert_bus_out[2]
+  PIN vert_bus_out[3]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    ANTENNADIFFAREA 0.445500 ;
+    PORT
+      LAYER met2 ;
+        RECT 17.570 44.960 17.850 48.960 ;
+    END
+  END vert_bus_out[3]
+  OBS
+      LAYER nwell ;
+        RECT 1.650 2.635 33.770 46.325 ;
+      LAYER li1 ;
+        RECT 1.840 2.635 33.580 46.325 ;
+      LAYER met1 ;
+        RECT 1.840 2.480 33.580 46.480 ;
+      LAYER met2 ;
+        RECT 2.950 44.680 4.860 45.550 ;
+        RECT 2.400 4.280 4.860 44.680 ;
+        RECT 2.950 2.875 4.860 4.280 ;
+        RECT 7.020 44.680 7.170 45.550 ;
+        RECT 8.010 44.680 8.160 45.550 ;
+        RECT 7.020 4.280 8.160 44.680 ;
+        RECT 7.020 2.875 7.170 4.280 ;
+        RECT 8.010 2.875 8.160 4.280 ;
+        RECT 10.320 44.680 12.230 45.550 ;
+        RECT 13.070 44.680 17.290 45.550 ;
+        RECT 18.130 44.680 22.350 45.550 ;
+        RECT 23.190 44.680 25.160 45.550 ;
+        RECT 10.320 4.280 25.160 44.680 ;
+        RECT 10.320 2.875 12.230 4.280 ;
+        RECT 13.070 2.875 17.290 4.280 ;
+        RECT 18.130 2.875 22.350 4.280 ;
+        RECT 23.190 2.875 25.160 4.280 ;
+        RECT 27.320 44.680 27.410 45.550 ;
+        RECT 28.250 44.680 28.460 45.550 ;
+        RECT 27.320 4.280 28.460 44.680 ;
+        RECT 27.320 2.875 27.410 4.280 ;
+        RECT 28.250 2.875 28.460 4.280 ;
+        RECT 30.620 44.680 32.470 45.550 ;
+        RECT 30.620 4.280 33.020 44.680 ;
+        RECT 30.620 2.875 32.470 4.280 ;
+      LAYER met3 ;
+        RECT 4.400 43.160 31.020 44.025 ;
+        RECT 3.285 36.400 31.890 43.160 ;
+        RECT 4.400 35.000 31.020 36.400 ;
+        RECT 3.285 28.240 31.890 35.000 ;
+        RECT 4.400 26.840 31.020 28.240 ;
+        RECT 3.285 26.220 31.890 26.840 ;
+        RECT 3.285 22.920 31.890 23.820 ;
+        RECT 3.285 20.080 31.890 20.520 ;
+        RECT 4.400 18.680 31.020 20.080 ;
+        RECT 3.285 11.920 31.890 18.680 ;
+        RECT 4.400 10.520 31.020 11.920 ;
+        RECT 3.285 3.760 31.890 10.520 ;
+        RECT 4.400 2.895 31.020 3.760 ;
+  END
+END CLB
+END LIBRARY
+
