@@ -48,10 +48,6 @@ module CLB_Grid #(
     output  logic [(4*COLUMNS)-1:0] vert_bus_out
 );
 
-    // One entry per grid cell for every signal that chains between neighbors.
-    // NOTE: assumes CLB has clk_out/reset_out relay outputs, based on your
-    // original code reading them from neighboring instances -- adjust the
-    // port names below if that's not actually CLB's interface.
     logic [ROWS-1:0][COLUMNS-1:0][3:0] horz_chain;
     logic [ROWS-1:0][COLUMNS-1:0][3:0] vert_chain;
     logic [ROWS-1:0][COLUMNS-1:0]      clk_chain;
