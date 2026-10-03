@@ -265,9 +265,9 @@ module IO_Controller (
             from_fabric_buses[output_mux_sel0]
         };
         
-        // Set DDIO direction to input when programming
+        // Freeze outputs when freeze_fabric high
         ddio_out = freeze_fabric ? '0 : pregate_ddio_out; 
-        ddio_dir = freeze_fabric ? '0 : pregate_ddio_dir; 
+        ddio_dir = freeze_fabric ? '0 : pregate_ddio_dir; // Set DDIO direction to input when programming
         chip_outputs = freeze_fabric ? '0 : pregate_chip_outputs; 
     end
 
