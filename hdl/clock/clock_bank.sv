@@ -5,6 +5,7 @@ module Clock_Bank # (
     input   logic       shift_clk,
     input   logic       shift_data_in,
     output  logic       shift_data_out,
+    input   logic       freeze_fabric,
     
     // Fabric Connections
     input   logic [(4*CLK_NUM)-1:0] buses,
@@ -33,7 +34,7 @@ module Clock_Bank # (
             begin : clk_routing
                 if (i == 0)
                 begin
-                    prev_clk[i] = clks[CLK_NUM-1];
+                    prev_clk[i] = freeze_fabric ? '0 : clks[CLK_NUM-1];
                 end
                 else
                 begin

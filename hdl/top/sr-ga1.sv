@@ -102,6 +102,7 @@ module SR_GA1 (
         .shift_clk(shift_clk),
         .shift_data_in(io_clk_data_bridge),
         .shift_data_out(shift_data_out),
+        .freeze_fabric(freeze_fabric),
         .buses(vertical_buses),
         .clks(column_clks)
     );
