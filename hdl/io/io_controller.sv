@@ -154,15 +154,15 @@ module IO_Controller (
     
     // Internal connections
     logic [15:0] input_mux_in;
-    logic [9:0]  gated_chip_outputs;
+    logic [9:0]  pregate_chip_outputs;
     logic [3:0]  input_mux_sel0a, input_mux_sel1a, input_mux_sel2a, input_mux_sel3a;
     logic [3:0]  input_mux_sel0b, input_mux_sel1b, input_mux_sel2b, input_mux_sel3b;
     logic [3:0]  output_mux_sel0, output_mux_sel1, output_mux_sel2, output_mux_sel3;
     logic [3:0]  output_mux_sel_ddio0, output_mux_sel_ddio1;
     logic [3:0]  output_mux_sel_ddio_dir0, output_mux_sel_ddio_dir1;
     logic [1:0]  ddio_in_pre_mux;
-    logic [1:0]  gated_ddio_out;
-    logic [1:0]  gated_ddio_dir;
+    logic [1:0]  pregate_ddio_out;
+    logic [1:0]  pregate_ddio_dir;
     
     // Register block
     logic [63:0] reg_data;
@@ -241,17 +241,17 @@ module IO_Controller (
         output_mux_sel_ddio_dir0 = reg_data[59:56];
         output_mux_sel_ddio_dir1 = reg_data[63:60];
         
-        gated_ddio_out = {
+        pregate_ddio_out = {
             from_fabric_buses[output_mux_sel_ddio1],
             from_fabric_buses[output_mux_sel_ddio0]
         };
         
-        gated_ddio_dir = {
+        pregate_ddio_dir = {
             from_fabric_buses[output_mux_sel_ddio_dir1],
             from_fabric_buses[output_mux_sel_ddio_dir0]
         };
         
-        gated_chip_outputs = {
+        pregate_chip_outputs = {
             from_fabric_buses[15],
             from_fabric_buses[14],
             from_fabric_buses[11],
@@ -266,9 +266,9 @@ module IO_Controller (
         };
         
         // Set DDIO direction to input when programming
-        ddio_out = freeze_fabric ? '0 : gated_ddio_out; 
-        ddio_dir = freeze_fabric ? '0 : gated_ddio_dir; 
-        chip_outputs = freeze_fabric ? '0 : gated_chip_outputs; 
+        ddio_out = freeze_fabric ? '0 : pregate_ddio_out; 
+        ddio_dir = freeze_fabric ? '0 : pregate_ddio_dir; 
+        chip_outputs = freeze_fabric ? '0 : pregate_chip_outputs; 
     end
 
 endmodule

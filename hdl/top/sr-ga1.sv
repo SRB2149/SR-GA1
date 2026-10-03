@@ -50,7 +50,7 @@ module SR_GA1 (
     
     // CLB Routing
     logic [(4*COLUMNS)-1:0] vertical_buses;
-    logic [(4*COLUMNS)-1:0] gated_vertical_buses;
+    logic [(4*COLUMNS)-1:0] pregate_vertical_buses;
     logic [COLUMNS-1:0]     column_clks;
     logic [15:0]            to_fabric_buses;
     logic [15:0]            from_fabric_buses;
@@ -87,13 +87,13 @@ module SR_GA1 (
         .column_clks(column_clks),
         .horz_bus_in(to_fabric_buses),
         .horz_bus_out(from_fabric_buses),
-        .vert_bus_in(vertical_buses), // Vertical buses loop back around
-        .vert_bus_out(gated_vertical_buses) // They also act as an input to the clock bank (below)
+        .vert_bus_in(vertical_buses),         // Vertical buses loop back around
+        .vert_bus_out(pregate_vertical_buses) // They also act as an input to the clock bank (below)
     );
     
     always_comb
     begin : vertical_feedback_gating
-        vertical_buses = freeze_fabric ? '0 : gated_vertical_buses;
+        vertical_buses = freeze_fabric ? '0 : pregate_vertical_buses;
     end
     
     Clock_Bank # (
