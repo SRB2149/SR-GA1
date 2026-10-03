@@ -20,6 +20,7 @@ module Clock_Bank_unit_test;
     logic shift_clk;
     logic shift_data_in;
     logic shift_data_out;
+    logic freeze_fabric;
     logic [(4*CLK_NUM)-1:0] buses;
     logic [CLK_NUM-1:0] clks;
 
@@ -49,6 +50,7 @@ module Clock_Bank_unit_test;
         .shift_clk(shift_clk),
         .shift_data_in(shift_data_in),
         .shift_data_out(shift_data_out),
+        .freeze_fabric(freeze_fabric),
         .buses(buses),
         .clks(clks)
     );
@@ -69,6 +71,7 @@ module Clock_Bank_unit_test;
         svunit_ut.setup();
         /* Place Setup Code Here */
         buses = '0;
+        freeze_fabric = '0;
     endtask
 
 
@@ -149,6 +152,47 @@ module Clock_Bank_unit_test;
         
         `FAIL_UNLESS_EQUAL('0, clks[5])
         `FAIL_UNLESS_EQUAL('0, clks[6])
+    `SVTEST_END
+    
+    `SVTEST(test_freeze_fabric)
+        configure(21'b011_000_000_000_000_000_100);
+        
+        #1ns;
+        
+        buses[(4*6)+3] = '1;
+        
+        #1ns;
+        
+        `FAIL_UNLESS_EQUAL('1, clks[6])
+        `FAIL_UNLESS_EQUAL('1, clks[0])
+        
+        freeze_fabric = '1;
+        
+        #1ns;
+        
+        `FAIL_UNLESS_EQUAL('1, clks[6])
+        `FAIL_UNLESS_EQUAL('0, clks[0])
+        
+        buses[(4*6)+3] = '0;
+        
+        #1ns;
+        
+        `FAIL_UNLESS_EQUAL('0, clks[6])
+        `FAIL_UNLESS_EQUAL('0, clks[0])
+        
+        buses[(4*6)+3] = '1;
+        
+        #1ns;
+        
+        `FAIL_UNLESS_EQUAL('1, clks[6])
+        `FAIL_UNLESS_EQUAL('0, clks[0])
+        
+        freeze_fabric = '0;
+        
+        #1ns;
+        
+        `FAIL_UNLESS_EQUAL('1, clks[6])
+        `FAIL_UNLESS_EQUAL('1, clks[0])
     `SVTEST_END
 
     `SVUNIT_TESTS_END
