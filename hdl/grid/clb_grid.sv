@@ -25,6 +25,11 @@
 //      The numbers in each box represent the order the CLBs are loaded.
 //      Data enters at 000 and snakes around to the next highest cell,
 //      so 000 -> 001 -> 002 -> 003 -> 004 and so on (raster pattern).
+//
+//      Signal flow directions:
+//        horz bus, shift_clk     : left  -> right (column 0 -> COLUMNS-1)
+//        vert bus, carry         : bottom -> top  (row 0 -> ROWS-1)
+//        column clk, reset       : top    -> bottom (row ROWS-1 -> 0)
 
 module CLB_Grid #(
     parameter int ROWS    = 4,
@@ -38,7 +43,7 @@ module CLB_Grid #(
     // Global reset (synchronous to column clocks)
     input   logic       reset,
 
-    // Column clocks
+    // Column clocks (enter at the top row of each column)
     input   logic [COLUMNS-1:0]     column_clks,
 
     // Grid Buses
@@ -90,21 +95,28 @@ module CLB_Grid #(
                     assign shift_data_in_sel = shift_data_chain[r][c-1];
                 end
 
-                // Vertical chain: edge cell (top row) pulls from the grid's
-                // own input ports; interior cells pull from the cell above.
-                // The carry chain starts at 0 in every column and does not
-                // wrap like the vertical bus does -- a wrap would close a
-                // combinational loop through the adder core.
+                // Vertical data chain: edge cell (bottom row, r == 0) pulls
+                // from the grid's own input port; interior cells pull from
+                // the cell below. The carry chain starts at 0 in every column
+                // and does not wrap like the vertical bus does -- a wrap
+                // would close a combinational loop through the adder core.
                 if (r == 0) begin : vert_edge
-                    assign clk_in_sel   = column_clks[c];
-                    assign reset_in_sel = reset;
                     assign carry_in_sel = 1'b0;
                     assign vert_in_sel  = vert_bus_in[(4*c) +: 4];
                 end else begin : vert_interior
-                    assign clk_in_sel   = clk_chain[r-1][c];
-                    assign reset_in_sel = reset_chain[r-1][c];
                     assign carry_in_sel = carry_chain[r-1][c];
                     assign vert_in_sel  = vert_chain[r-1][c];
+                end
+
+                // Clock/reset chain: enters at the top row (r == ROWS-1) and
+                // propagates downward, so each interior cell pulls from the
+                // cell above. Row 0's clk_out/reset_out are left unconnected.
+                if (r == ROWS-1) begin : clk_edge
+                    assign clk_in_sel   = column_clks[c];
+                    assign reset_in_sel = reset;
+                end else begin : clk_interior
+                    assign clk_in_sel   = clk_chain[r+1][c];
+                    assign reset_in_sel = reset_chain[r+1][c];
                 end
 
                 CLB clb_u (

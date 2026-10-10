@@ -31,15 +31,15 @@
 //                  v v v v
 //                  | | | |
 //                  b b b b
-//                  u u u u   r c
-//                  s s s s   e a
-//                  | | | | c s r
-//                  o o o o l e r
-//                  u u u u k t y
-//                  t t t t | | |
-//                  - - - - o o o
-//                  0 1 2 3 u u u
-//                  - - - - t t t
+//                  u u u u     c
+//                  s s s s     a
+//                  | | | |     r
+//                  o o o o     r
+//                  u u u u   r y
+//                  t t t t   e |
+//                  - - - - c s o
+//                  0 1 2 3 l e u
+//                  - - - - k t t
 //                     
 //                 _|_|_|_|_|_|_|_
 // h_bus_in[0]   -|               |- h_bus_out[0]
@@ -53,12 +53,12 @@
 //                  v v v v c r c
 //                  | | | | l e a
 //                  b b b b k s r
-//                  u u u u   e r
-//                  s s s s   t y
-//                  | | | |     |
-//                  i i i i     i
-//                  n n n n     n
-//                  - - - -
+//                  u u u u | e r
+//                  s s s s o t y
+//                  | | | | u | |
+//                  i i i i t o i
+//                  n n n n   u n
+//                  - - - -   t
 //                  0 1 2 3
 //                  - - - -
 
