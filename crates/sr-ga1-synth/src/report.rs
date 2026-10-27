@@ -1,6 +1,6 @@
 //! The synthesis report.
 //!
-//! On a 28-CLB fabric the interesting question is almost never "did it
+//! On a fabric this small the interesting question is almost never "did it
 //! work" but "what did it cost, and what is nearly full". So the report
 //! leads with a utilisation table giving every resource as an absolute figure
 //! *and* as a percentage of capacity, then says where each IO pin landed and
@@ -22,7 +22,7 @@ use crate::rrg::Node;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-/// Longest chain of operation cores a signal passes through. There is no
+/// Longest chain of LUTs a signal passes through. There is no
 /// timing model, so this is a structural depth, not a delay.
 pub fn logic_depth(packed: &PackedDesign) -> usize {
     let mut driver: BTreeMap<u32, usize> = BTreeMap::new();
@@ -105,21 +105,57 @@ pub fn loopback_wiring(outcome: &Outcome) -> Vec<LoopbackLink> {
     out
 }
 
-/// The pad an RRG node *is*, for the two node kinds that sit on the chip edge.
+/// The pad an RRG node *is*, for the two pad node kinds.
 fn pad_at(outcome: &Outcome, node: Node) -> Option<String> {
     match node {
-        Node::HSeg { row, col, lane } if col == outcome.fabric.columns => outcome
-            .fabric
-            .io_outputs
-            .get(row)
-            .and_then(|lanes| lanes.get(lane))
-            .cloned()
-            .flatten(),
-        Node::HSeg { row, col: 0, lane } => {
-            outcome.fabric.io_inputs.get(row).and_then(|lanes| lanes.get(lane)).cloned()
-        }
+        Node::OutPad(pad) => outcome.fabric.io_outputs.get(pad).cloned(),
+        Node::InPad(pad) => outcome.fabric.io_inputs.get(pad).cloned(),
         _ => None,
     }
+}
+
+/// The edge lanes a pad's routing actually uses: where an input pad's signal
+/// enters the fabric, or which right-edge lane drives an output pad.
+fn pad_lanes(outcome: &Outcome, pad: Node) -> Vec<(usize, usize)> {
+    let Some(id) = outcome.rrg.id(pad) else { return Vec::new() };
+    let mut lanes = Vec::new();
+    for route in &outcome.routing.routes {
+        for (from, edge) in &route.edges {
+            let lane = match (outcome.rrg.node(*from), outcome.rrg.node(edge.to)) {
+                (Node::InPad(_), Node::HSeg { row, lane, .. }) if *from == id => Some((row, lane)),
+                (Node::HSeg { row, lane, .. }, Node::OutPad(_)) if edge.to == id => Some((row, lane)),
+                _ => None,
+            };
+            if let Some(lane) = lane {
+                if !lanes.contains(&lane) {
+                    lanes.push(lane);
+                }
+            }
+        }
+    }
+    lanes.sort_unstable();
+    lanes
+}
+
+fn lanes_text(lanes: &[(usize, usize)]) -> String {
+    if lanes.is_empty() {
+        return "unrouted".to_string();
+    }
+    lanes.iter().map(|(r, l)| format!("row {} lane {}", r, l)).collect::<Vec<_>>().join(", ")
+}
+
+/// The chip outputs the IO controller reads back on-chip, as
+/// `(output pad, left-edge row, lane, net)`.
+pub fn on_chip_loops(outcome: &Outcome) -> Vec<(String, usize, usize, String)> {
+    let mut out = Vec::new();
+    for (source, sink, net) in outcome.routing.on_chip_loops(&outcome.rrg) {
+        let (Some(pad), Node::HSeg { row, lane, .. }) = (pad_at(outcome, source), sink) else {
+            continue;
+        };
+        let name = outcome.wiring.problem.nets.get(net).map(|n| n.name.clone()).unwrap_or_default();
+        out.push((pad, row, lane, name));
+    }
+    out
 }
 
 /// Whether a pin was chosen by the tool or pinned by the user, which the report
@@ -183,9 +219,12 @@ pub struct Usage {
     pub vert_by_lane: BTreeMap<(usize, usize), usize>,
     pub in_pads_used: usize,
     pub in_pads: usize,
-    pub in_constants: usize,
     pub out_pads_used: usize,
     pub out_pads: usize,
+    /// Left-edge lanes fed by an on-chip loop, and how many lanes an input mux
+    /// could feed that way.
+    pub on_chip_used: usize,
+    pub on_chip_lanes: usize,
     pub loops_used: usize,
     pub loops_pool: usize,
     pub bits: usize,
@@ -226,26 +265,15 @@ pub fn usage(outcome: &Outcome) -> Usage {
         }
     }
 
-    // Pads. A constant-tied input carries no design signal, so it is capacity
-    // the design could never have used; count it separately rather than
-    // deflating the percentage with pads that were never available.
-    let mut in_pads = 0;
-    let mut in_constants = 0;
-    for row in 0..fabric.rows {
-        for lane in 0..fabric.horz_lanes {
-            if fabric.io_constant(row, lane).is_some() {
-                in_constants += 1;
-            } else if fabric.io_inputs.get(row).and_then(|l| l.get(lane)).is_some() {
-                in_pads += 1;
-            }
-        }
-    }
-    let out_pads = fabric
-        .io_outputs
-        .iter()
-        .flatten()
-        .filter(|name| name.as_deref().is_some_and(|n| !n.is_empty()))
-        .count();
+    // Pads, on both sides, DDIO included.
+    let in_pads = fabric.io_inputs.len();
+    let out_pads = fabric.io_outputs.len();
+    let on_chip = on_chip_loops(outcome);
+    let on_chip_lanes = fabric
+        .loopable_outputs()
+        .first()
+        .map(|&o| fabric.lanes_for_source(crate::fabric::IoSource::OutPad(o)).len())
+        .unwrap_or(0);
 
     let reset = packed.reset;
     let in_pads_used = outcome
@@ -280,11 +308,14 @@ pub fn usage(outcome: &Outcome) -> Usage {
             .union(&wiring.iter().map(|l| l.to.clone()).collect())
             .count(),
         in_pads,
-        in_constants,
         out_pads_used: out_pads_used
             .union(&wiring.iter().map(|l| l.from.clone()).collect())
-            .count(),
+            .chain(on_chip.iter().map(|(pad, ..)| pad))
+            .collect::<BTreeSet<_>>()
+            .len(),
         out_pads,
+        on_chip_used: on_chip.len(),
+        on_chip_lanes,
         loops_used: wiring.len(),
         loops_pool: pool.outputs.len().min(pool.inputs.len()),
         bits: fabric.total_bits(),
@@ -378,7 +409,7 @@ fn input_consumers(outcome: &Outcome, net: u32) -> String {
 
 // ---- the report ------------------------------------------------------------
 
-pub fn render(outcome: &Outcome, target: &Target) -> String {
+pub fn render(outcome: &Outcome, _target: &Target) -> String {
     let fabric = &outcome.fabric;
     let packed = &outcome.packed;
     let u = usage(outcome);
@@ -389,7 +420,19 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
     let _ = writeln!(out);
     let _ = writeln!(out, "design            {}", packed.top);
     let _ = writeln!(out, "fabric            {} ({}x{})", fabric.name, fabric.columns, fabric.rows);
-    let _ = writeln!(out, "bitstream length  {} bits", u.bits);
+    match fabric.start_bit {
+        Some(_) => {
+            let _ = writeln!(
+                out,
+                "bitstream length  {} bits (start bit + {} configuration bits)",
+                fabric.stream_bits(),
+                u.bits
+            );
+        }
+        None => {
+            let _ = writeln!(out, "bitstream length  {} bits", u.bits);
+        }
+    }
     let _ = writeln!(
         out,
         "search            {} attempt(s), attempt {} won, {:.2}s elapsed",
@@ -413,6 +456,7 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
     metric(&mut out, "vertical segments", u.vert_used, u.vert);
     metric(&mut out, "input pads", u.in_pads_used, u.in_pads);
     metric(&mut out, "output pads", u.out_pads_used, u.out_pads);
+    metric(&mut out, "on-chip loops", u.on_chip_used, u.on_chip_lanes);
     if u.loops_pool > 0 {
         metric(&mut out, "loop-around wires", u.loops_used, u.loops_pool);
     }
@@ -423,9 +467,8 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
     );
     let _ = writeln!(
         out,
-        "  {} further input pad(s) are tied to a constant by the fabric and carry no \
-         design signal.",
-        u.in_constants
+        "  pad totals include the DDIO pads' sides; on-chip loops are left-edge lanes \
+         fed from a chip output by the IO controller."
     );
 
     // ---- cell types --------------------------------------------------------
@@ -454,7 +497,7 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
     let _ = writeln!(
         out,
         "  {:<4} {:<16} {:<12} {:<14} {:<28} {}",
-        "dir", "signal", "pad", "position", "produced by / consumed by", "chosen"
+        "dir", "signal", "pad", "lane", "produced by / consumed by", "chosen"
     );
     for port in &packed.inputs {
         if packed.reset == Some(port.net) {
@@ -472,10 +515,10 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
         }
         match outcome.placement.input_pins.get(&port.net) {
             Some(pad) => {
-                let position = target
-                    .input_pad(pad)
-                    .map(|(r, l)| format!("row {} lane {}", r, l))
-                    .unwrap_or_else(|| "?".to_string());
+                let position = match fabric.input_pad(pad) {
+                    Some(index) => lanes_text(&pad_lanes(outcome, Node::InPad(index))),
+                    None => "?".to_string(),
+                };
                 let _ = writeln!(
                     out,
                     "  {:<4} {:<16} {:<12} {:<14} {:<28} {}",
@@ -499,10 +542,10 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
     for port in &packed.outputs {
         match outcome.placement.output_pins.get(&port.net) {
             Some(pad) => {
-                let position = target
-                    .output_pad(pad)
-                    .map(|(r, l)| format!("row {} lane {}", r, l))
-                    .unwrap_or_else(|| "?".to_string());
+                let position = match fabric.output_pad(pad) {
+                    Some(index) => lanes_text(&pad_lanes(outcome, Node::OutPad(index))),
+                    None => "?".to_string(),
+                };
                 let _ = writeln!(
                     out,
                     "  {:<4} {:<16} {:<12} {:<14} {:<28} {}",
@@ -540,32 +583,15 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
         .map(|s| s.as_str())
         .chain(wiring.iter().map(|l| l.from.as_str()))
         .collect();
-    let mut free_in: Vec<String> = Vec::new();
-    for row in 0..fabric.rows {
-        for lane in 0..fabric.horz_lanes {
-            if fabric.io_constant(row, lane).is_some() {
-                continue;
-            }
-            if let Some(name) = fabric.io_inputs.get(row).and_then(|l| l.get(lane)) {
-                if !claimed_in.contains(name.as_str()) {
-                    free_in.push(format!("{} (row {} lane {})", name, row, lane));
-                }
-            }
-        }
-    }
-    let mut free_out: Vec<String> = Vec::new();
-    for row in 0..fabric.rows {
-        for lane in 0..fabric.horz_lanes {
-            let Some(Some(name)) = fabric.io_outputs.get(row).map(|l| l.get(lane).cloned().flatten())
-            else {
-                continue;
-            };
-            if name.is_empty() || claimed_out.contains(name.as_str()) {
-                continue;
-            }
-            free_out.push(format!("{} (row {} lane {})", name, row, lane));
-        }
-    }
+    let on_chip = on_chip_loops(outcome);
+    let free_in: Vec<String> =
+        fabric.io_inputs.iter().filter(|n| !claimed_in.contains(n.as_str())).cloned().collect();
+    let free_out: Vec<String> = fabric
+        .io_outputs
+        .iter()
+        .filter(|n| !claimed_out.contains(n.as_str()) && !on_chip.iter().any(|(p, ..)| p == *n))
+        .cloned()
+        .collect();
     let _ = writeln!(out);
     let _ = writeln!(
         out,
@@ -584,14 +610,20 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
     // pad still carries that value in silicon, so it is part of where the
     // design ended up.
     let mut incidental: Vec<String> = Vec::new();
-    for route in &outcome.routing.routes {
+    for (net, route) in outcome.routing.routes.iter().enumerate() {
+        // A constant held on a pad — an unused DDIO's direction tied to 0 —
+        // is not a signal.
+        if matches!(
+            outcome.wiring.problem.nets.get(net).map(|n| n.kind),
+            Some(crate::route::NetKind::Constant(_))
+        ) {
+            continue;
+        }
         for &node in &route.nodes {
-            if let Node::HSeg { col, .. } = outcome.rrg.node(node) {
-                if col != fabric.columns {
-                    continue;
-                }
+            if let Node::OutPad(_) = outcome.rrg.node(node) {
                 if let Some(name) = pad_at(outcome, outcome.rrg.node(node)) {
-                    if !claimed_out.contains(name.as_str()) && !incidental.contains(&name) {
+                    let looped = on_chip.iter().any(|(pad, ..)| *pad == name);
+                    if !claimed_out.contains(name.as_str()) && !looped && !incidental.contains(&name) {
                         incidental.push(name);
                     }
                 }
@@ -604,6 +636,25 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
             out,
             "  output pads carrying a routed signal that is not a design output: {}",
             incidental.join(", ")
+        );
+    }
+
+    // ---- on-chip loops -----------------------------------------------------
+    let _ = writeln!(out);
+    heading(&mut out, "on-chip loops");
+    if on_chip.is_empty() {
+        let _ = writeln!(out, "  none used");
+    } else {
+        for (pad, row, lane, net) in &on_chip {
+            let _ = writeln!(
+                out,
+                "  {:<12} -> row {} lane {}  carrying {}",
+                pad, row, lane, net
+            );
+        }
+        let _ = writeln!(
+            out,
+            "  each of these chip outputs also presents the signal it carries on its pin"
         );
     }
 
@@ -626,18 +677,10 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
         } else {
             let _ = writeln!(out, "  THIS DESIGN REQUIRES THE FOLLOWING PHYSICAL CONNECTIONS:");
             for link in &wiring {
-                let from = target
-                    .output_pad(&link.from)
-                    .map(|(r, l)| format!("row {} lane {}", r, l))
-                    .unwrap_or_else(|| "?".to_string());
-                let to = target
-                    .input_pad(&link.to)
-                    .map(|(r, l)| format!("row {} lane {}", r, l))
-                    .unwrap_or_else(|| "?".to_string());
                 let _ = writeln!(
                     out,
-                    "    wire {:<12} ({:<12}) -> {:<12} ({:<12}) carrying {}",
-                    link.from, from, link.to, to, link.net
+                    "    wire {:<12} -> {:<12} carrying {}",
+                    link.from, link.to, link.net
                 );
             }
             let spare_out: Vec<String> = pool
@@ -683,24 +726,17 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
     );
     let enable_lane = backend::enable_lane(fabric);
     if let Some(lane) = enable_lane.filter(|_| u.registers > 0) {
-        let free_row = (0..fabric.rows).find(|&r| fabric.io_constant(r, lane) == Some(true));
         let _ = writeln!(
             out,
-            "  lane {} is the write enable; {}",
-            lane,
-            match free_row {
-                Some(row) => format!("row {} receives a constant 1 at the left edge", row),
-                None => "no row receives a free constant 1".to_string(),
-            }
+            "  lane {} is the write enable; a constant 1 there comes from the major mux of \
+             the CLB to the left",
+            lane
         );
         for (index, cell) in packed.cells.iter().enumerate() {
             let Some(reg) = &cell.reg else { continue };
             let placed = &outcome.placement.cells[index];
             let how = match &reg.enable {
-                Enable::Always if Some(placed.row) == free_row => {
-                    "always, free from the row's constant".to_string()
-                }
-                Enable::Always => "always, driven by an upstream CLB".to_string(),
+                Enable::Always => "always, constant 1 from an upstream CLB".to_string(),
                 Enable::Net(net) => format!(
                     "gated by {}",
                     packed.names.get(*net).unwrap_or("<unnamed>")
@@ -746,10 +782,18 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
             );
             for &cell in chain {
                 let placed = &outcome.placement.cells[cell];
-                let _ = writeln!(out, "    row {} = {}", placed.row, packed.cells[cell].name);
+                let tap = packed.cells[cell].carry.as_ref().is_some_and(|l| l.tap);
+                let _ = writeln!(
+                    out,
+                    "    row {} = {}{}",
+                    placed.row,
+                    packed.cells[cell].name,
+                    if tap { "  (carry tap: the carry below, as a routable net)" } else { "" }
+                );
             }
-            if chain.len() == fabric.rows {
-                let _ = writeln!(out, "    column full; the top cell's carry-out is unreachable");
+            let tapped = chain.last().is_some_and(|&c| packed.cells[c].carry.as_ref().is_some_and(|l| l.tap));
+            if !tapped && chain.len() == fabric.rows {
+                let _ = writeln!(out, "    column full; the top cell's carry-out is not needed");
             }
         }
     }
@@ -892,7 +936,7 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
     heading(&mut out, "logic depth");
     let _ = writeln!(
         out,
-        "  {} operation core(s) on the longest combinational path, counted \
+        "  {} LUT(s) on the longest combinational path, counted \
          structurally: there is no timing model",
         logic_depth(packed)
     );
@@ -911,19 +955,25 @@ pub fn render(outcome: &Outcome, target: &Target) -> String {
             pct(outcome.constraints.ddio.len(), fabric.ddio.len()).trim()
         );
         for (index, pad) in fabric.ddio.iter().enumerate() {
+            let (input, output, dir) = (
+                &fabric.io_inputs[pad.input],
+                &fabric.io_outputs[pad.output],
+                &fabric.io_outputs[pad.dir],
+            );
             match outcome.constraints.ddio.iter().find(|b| b.pin == index) {
                 Some(b) => {
                     let _ = writeln!(
                         out,
                         "  pad {} in={} out={} dir={}  <- {} / {} / {}",
-                        index, pad.input, pad.output, pad.dir, b.input, b.output, b.dir
+                        index, input, output, dir, b.input, b.output, b.dir
                     );
                 }
                 None => {
                     let _ = writeln!(
                         out,
-                        "  pad {} in={} out={} dir={}  unbound; {} is forced 0 while {} is 1",
-                        index, pad.input, pad.output, pad.dir, pad.input, pad.dir
+                        "  pad {} in={} out={} dir={}  unbound; {} is held at 0, so the pad stays \
+                         an input ({} reads {} back while {} is 1)",
+                        index, input, output, dir, dir, input, output, dir
                     );
                 }
             }

@@ -5,8 +5,10 @@
 //! them. What is checked:
 //! - CSB chains that couple in a full circle with no real source (error);
 //! - potential combinational loops in the value-dependency graph — through
-//!   the DDIO direction feedback, or the vertical ring now that input mux c
-//!   can read the combinational lane 0 (error);
+//!   the vertical ring (input mux c reads the combinational lane 0), the IO
+//!   controller's on-chip loops, DDIO read-back or board wiring (error);
+//! - a DDIO direction driven by a live signal the design never claimed — the
+//!   pad would turn into an output whenever it is 1 (warning);
 //! - columns whose CSB taps a floating pass-through ring — no clock (warning);
 //! - vertical rings that are pure pass-through loops with no driver (warning);
 //! - used logic fed by a floating loop (warning);
@@ -16,8 +18,8 @@
 //! - blocks that neither originate nor repeat any live signal (info).
 
 use crate::config::{BlockId, Design, IoPad};
-use crate::fabric::{BusOut, Fabric, Source};
-use crate::naming::{resolve, Namer, NetOrigin};
+use crate::fabric::{BusOut, Fabric, IoSource, Source};
+use crate::naming::{resolve, Namer, NetOrigin, OutputKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -132,14 +134,47 @@ pub fn check(fabric: &Fabric, design: &Design) -> Vec<DrcItem> {
         }
     }
 
-    // Potential combinational loops (through logic, the DDIO gate, or a
-    // loop-around board wire).
+    // A DDIO pad whose direction follows a design signal turns into an output
+    // whenever that signal is 1. The all-zero IO configuration points every
+    // direction mux at row 0 lane 0, so this is easy to do by accident; a
+    // design that means it names the direction pad.
+    for d in &fabric.ddio {
+        let dir_pad = IoPad::output(d.dir);
+        let (r, l) = design.pad_lane(fabric, d.dir);
+        let origin = nets.horz_edge(r, l);
+        // A LUT holding all zeros is a constant 0 however it is wired.
+        let constant_zero = match origin {
+            NetOrigin::Const(false) | NetOrigin::FloatingLoop => true,
+            NetOrigin::ClbOutput { col, row, kind: OutputKind::Op } => {
+                design.clb(col, row).get(fabric.lut.field) == 0
+            }
+            _ => false,
+        };
+        if design.io_name(dir_pad).is_none() && !constant_zero {
+            items.push(DrcItem {
+                severity: Severity::Warning,
+                block: Some(BlockId::Io),
+                message: format!(
+                    "{} follows \"{}\" (row {} lane {}): {} becomes an output whenever it is 1 — \
+                     point it at a constant 0 lane, or name the pad if this is intended",
+                    fabric.io_outputs[d.dir],
+                    namer.net_name(origin),
+                    r,
+                    l,
+                    fabric.io_inputs[d.input],
+                ),
+            });
+        }
+    }
+
+    // Potential combinational loops (through logic, a DDIO, or a loop back
+    // from the right edge on-chip or on the board).
     for blocks in combinational_loops(fabric, design) {
         let names: Vec<String> = blocks.iter().map(|&b| namer.block_name(b)).collect();
-        // A cycle closed only through board wiring passes through no block, so
-        // there is nothing to list; name the wiring instead.
-        let through = if names.is_empty() {
-            let wires: Vec<String> = design
+        // A cycle closed only through loop-back wiring passes through no CLB,
+        // so there is nothing to list; name the wiring instead.
+        let through = if names.iter().all(|n| *n == namer.block_name(BlockId::Io)) {
+            let mut wires: Vec<String> = design
                 .loopback()
                 .iter()
                 .map(|l| {
@@ -154,7 +189,14 @@ pub fn check(fabric: &Fabric, design: &Design) -> Vec<DrcItem> {
                     )
                 })
                 .collect();
-            format!("loop-around wiring ({})", wires.join(", "))
+            for row in 0..fabric.rows {
+                for lane in 0..fabric.horz_lanes {
+                    if let IoSource::OutPad(o) = design.left_source(fabric, row, lane) {
+                        wires.push(format!("{} -> row {} lane {} (on-chip)", fabric.io_outputs[o], row, lane));
+                    }
+                }
+            }
+            format!("loop-back wiring ({})", wires.join(", "))
         } else {
             names.join(", ")
         };
@@ -212,12 +254,12 @@ pub fn check(fabric: &Fabric, design: &Design) -> Vec<DrcItem> {
 // Liveness: which segments and cell outputs contribute to a chip output or a
 // column clock (demanded transitively from those seeds).
 
-struct Liveness {
-    horz: Vec<bool>,
-    vert: Vec<bool>,
-    need_op: Vec<bool>,
-    need_carry: Vec<bool>,
-    need_reg: Vec<bool>,
+pub(crate) struct Liveness {
+    pub(crate) horz: Vec<bool>,
+    pub(crate) vert: Vec<bool>,
+    pub(crate) need_op: Vec<bool>,
+    pub(crate) need_carry: Vec<bool>,
+    pub(crate) need_reg: Vec<bool>,
 }
 
 impl Liveness {
@@ -229,7 +271,7 @@ impl Liveness {
     }
 }
 
-fn liveness(fabric: &Fabric, design: &Design) -> Liveness {
+pub(crate) fn liveness(fabric: &Fabric, design: &Design) -> Liveness {
     let (columns, rows) = (fabric.columns, fabric.rows);
     let (hl, vl) = (fabric.horz_lanes, fabric.vert_lanes);
     let mut live = Liveness {
@@ -259,12 +301,9 @@ fn liveness(fabric: &Fabric, design: &Design) -> Liveness {
     let vmux: Vec<usize> = (0..vl).map(|lane| mux_for(BusOut::Vert(lane))).collect();
 
     let mut work: Vec<Demand> = Vec::new();
-    for (row, lanes) in fabric.io_outputs.iter().enumerate() {
-        for (lane, name) in lanes.iter().enumerate() {
-            if name.is_some() {
-                work.push(Demand::Seg(Seg::Horz { row, lane, pos: columns }));
-            }
-        }
+    for o in 0..fabric.io_outputs.len() {
+        let (row, lane) = design.pad_lane(fabric, o);
+        work.push(Demand::Seg(Seg::Horz { row, lane, pos: columns }));
     }
 
     while let Some(d) = work.pop() {
@@ -280,22 +319,13 @@ fn liveness(fabric: &Fabric, design: &Design) -> Liveness {
                 *slot = true;
                 match seg {
                     Seg::Horz { row, lane, pos: 0 } => {
-                        // A gated DDIO input depends on its direction output.
-                        let name = &fabric.io_inputs[row][lane];
-                        if let Some(d) = fabric.ddio.iter().find(|d| d.input == *name) {
-                            if let Some((dr, dl)) = out_pos(fabric, &d.dir) {
-                                work.push(Demand::Seg(Seg::Horz { row: dr, lane: dl, pos: columns }));
-                            }
-                        }
-                        // A looped input depends on the output the board wires
-                        // to it; without this, logic feeding a loop reads as
-                        // dead and gets reported as unused.
-                        if let Some(driver) = design.loopback_driver(IoPad::input(row, lane)) {
-                            work.push(Demand::Seg(Seg::Horz {
-                                row: driver.row,
-                                lane: driver.lane,
-                                pos: columns,
-                            }));
+                        // Whatever the IO controller reads here depends on the
+                        // right edge whenever it loops back: on-chip, through a
+                        // DDIO in output mode, or over a board wire. Without
+                        // this, logic feeding a loop reads as dead.
+                        for o in left_edge_outputs(fabric, design, row, lane) {
+                            let (r, l) = design.pad_lane(fabric, o);
+                            work.push(Demand::Seg(Seg::Horz { row: r, lane: l, pos: columns }));
                         }
                     }
                     Seg::Horz { row, lane, pos } => {
@@ -314,7 +344,8 @@ fn liveness(fabric: &Fabric, design: &Design) -> Liveness {
                     continue;
                 }
                 live.need_op[ci] = true;
-                push_input_demands(&mut work, fabric, design, col, row);
+                // The LUT result depends only on the inputs it reads.
+                push_input_demands(&mut work, fabric, design, col, row, true);
             }
             Demand::Carry(col, row) => {
                 let ci = row * columns + col;
@@ -322,7 +353,7 @@ fn liveness(fabric: &Fabric, design: &Design) -> Liveness {
                     continue;
                 }
                 live.need_carry[ci] = true;
-                push_input_demands(&mut work, fabric, design, col, row);
+                push_input_demands(&mut work, fabric, design, col, row, false);
             }
             Demand::Reg(col, row) => {
                 let ci = row * columns + col;
@@ -346,15 +377,6 @@ fn liveness(fabric: &Fabric, design: &Design) -> Liveness {
     return live;
 
     // -- helpers ---------------------------------------------------------
-
-    fn out_pos(fabric: &Fabric, name: &str) -> Option<(usize, usize)> {
-        fabric.io_outputs.iter().enumerate().find_map(|(row, lanes)| {
-            lanes
-                .iter()
-                .position(|n| n.as_deref() == Some(name))
-                .map(|lane| (row, lane))
-        })
-    }
 
     fn push_source_demand(
         work: &mut Vec<Demand>,
@@ -385,8 +407,19 @@ fn liveness(fabric: &Fabric, design: &Design) -> Liveness {
         }
     }
 
-    fn push_input_demands(work: &mut Vec<Demand>, fabric: &Fabric, design: &Design, col: usize, row: usize) {
-        for m in &fabric.input_muxes {
+    fn push_input_demands(
+        work: &mut Vec<Demand>,
+        fabric: &Fabric,
+        design: &Design,
+        col: usize,
+        row: usize,
+        lut_only: bool,
+    ) {
+        let lut = design.clb(col, row).get(fabric.lut.field);
+        for (k, m) in fabric.input_muxes.iter().enumerate() {
+            if lut_only && !lut_depends_on(fabric, lut, k) {
+                continue;
+            }
             let sel = design.clb(col, row).slice(&m.select) as usize;
             match m.sources[sel] {
                 Source::HorzIn(k) => work.push(Demand::Seg(Seg::Horz { row, lane: k, pos: col })),
@@ -473,11 +506,17 @@ pub fn combinational_loops(fabric: &Fabric, design: &Design) -> Vec<Vec<BlockId>
         }),
         Source::Op | Source::Carry => {
             // The cell's own inputs, plus every cell feeding it down the
-            // carry chain (which runs upward, so this always terminates).
+            // carry chain (which runs upward, so this always terminates). The
+            // LUT output depends only on the inputs its truth table reads;
+            // the carry depends on all of them.
             let mut r = row;
             loop {
                 let mut chained = false;
-                for m in &fabric.input_muxes {
+                let lut = design.clb(col, r).get(fabric.lut.field);
+                for (k, m) in fabric.input_muxes.iter().enumerate() {
+                    if r == row && src == Source::Op && !lut_depends_on(fabric, lut, k) {
+                        continue;
+                    }
                     let sel = design.clb(col, r).slice(&m.select) as usize;
                     let to = match m.sources[sel] {
                         Source::HorzIn(k) => Some(idx(Seg::Horz { row: r, lane: k, pos: col })),
@@ -510,29 +549,20 @@ pub fn combinational_loops(fabric: &Fabric, design: &Design) -> Vec<Vec<BlockId>
 
     for row in 0..rows {
         for lane in 0..hl {
-            // Gated left-edge inputs depend on the DDIO direction output.
-            let name = &fabric.io_inputs[row][lane];
-            if let Some(d) = fabric.ddio.iter().find(|d| d.input == *name) {
-                if let Some((dr, dl)) = fabric.io_outputs.iter().enumerate().find_map(|(r, lanes)| {
-                    lanes.iter().position(|n| n.as_deref() == Some(d.dir.as_str())).map(|l| (r, l))
-                }) {
-                    let from = idx(Seg::Horz { row, lane, pos: 0 });
-                    edges[from].push(Edge {
-                        to: idx(Seg::Horz { row: dr, lane: dl, pos: columns }),
-                        through_logic: true,
-                        loopback: false,
-                        block: None,
-                    });
-                }
-            }
-            // A board wire makes this input depend on the output it is tied to.
-            if let Some(driver) = design.loopback_driver(IoPad::input(row, lane)) {
-                let from = idx(Seg::Horz { row, lane, pos: 0 });
+            // A left-edge lane depends on every right-edge output it can read
+            // back: the selected output itself (on-chip), a DDIO's direction
+            // and output (read-back), or a board wire's driving output. A DDIO
+            // direction is a gate, so it counts as logic; the rest are wires
+            // that make a cycle reportable without being logic themselves.
+            let from = idx(Seg::Horz { row, lane, pos: 0 });
+            for o in left_edge_outputs(fabric, design, row, lane) {
+                let gate = fabric.ddio.iter().any(|d| d.dir == o);
+                let (r, l) = design.pad_lane(fabric, o);
                 edges[from].push(Edge {
-                    to: idx(Seg::Horz { row: driver.row, lane: driver.lane, pos: columns }),
-                    through_logic: false,
-                    loopback: true,
-                    block: None,
+                    to: idx(Seg::Horz { row: r, lane: l, pos: columns }),
+                    through_logic: gate,
+                    loopback: !gate,
+                    block: Some(BlockId::Io),
                 });
             }
             for pos in 1..=columns {
@@ -603,6 +633,7 @@ pub fn combinational_loops(fabric: &Fabric, design: &Design) -> Vec<Vec<BlockId>
                             blocks.sort_by_key(|b| match *b {
                                 BlockId::Clb { col, row } => (0, col, row),
                                 BlockId::Csb { col } => (1, col, 0),
+                                BlockId::Io => (2, 0, 0),
                             });
                             if !loops.contains(&blocks) {
                                 loops.push(blocks);
@@ -619,4 +650,39 @@ pub fn combinational_loops(fabric: &Fabric, design: &Design) -> Vec<Vec<BlockId>
         }
     }
     loops
+}
+
+/// The output-side pads a left-edge lane's value can depend on, under the
+/// current IO configuration: the output an on-chip loop reads; for a DDIO
+/// input, its direction and output (read back while in output mode); and the
+/// output a board wire ties to the input pad.
+fn left_edge_outputs(fabric: &Fabric, design: &Design, row: usize, lane: usize) -> Vec<usize> {
+    match design.left_source(fabric, row, lane) {
+        IoSource::OutPad(o) => vec![o],
+        IoSource::InPad(i) => {
+            let mut out = Vec::new();
+            if let Some(d) = fabric.ddio_of_input(i) {
+                out.push(d.dir);
+                out.push(d.output);
+            }
+            if let Some(from) = design.loopback_driver(IoPad::input(i)) {
+                if !from.input_side {
+                    out.push(from.index);
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Whether a LUT value's output changes with input mux `k` for some setting of
+/// the other inputs.
+pub fn lut_depends_on(fabric: &Fabric, lut: u64, k: usize) -> bool {
+    let n = fabric.input_muxes.len();
+    (0..1usize << n).any(|i| {
+        let mut inputs: Vec<bool> = (0..n).map(|b| (i >> b) & 1 != 0).collect();
+        let a = fabric.eval_lut(lut, &inputs);
+        inputs[k] = !inputs[k];
+        a != fabric.eval_lut(lut, &inputs)
+    })
 }

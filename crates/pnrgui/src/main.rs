@@ -1,4 +1,4 @@
-//! fpgatool — configure, visualise, simulate and export bitstreams for the
+//! pnrgui — configure, visualise, simulate and export bitstreams for the
 //! SR-GA1 fabric. Runs as a GUI with no arguments, or headless via the
 //! `build` / `check` / `import` / `diff` subcommands.
 

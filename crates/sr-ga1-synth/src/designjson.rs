@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub const FILE_VERSION: u32 = 1;
+pub const FILE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct DesignFileError {
@@ -33,11 +33,10 @@ pub type Stimulus = BTreeMap<String, Vec<u8>>;
 
 /// One loop-around board wire the configuration depends on.
 ///
-/// This is an extension to the format the visual programmer originally wrote. It
-/// is the last field and is omitted when empty, so a design with no loop-around
-/// wiring still round-trips byte-for-byte against the GUI's own exports — which
-/// is what the golden tests check. `fpga_core::designfile::LoopbackLink` matches
-/// this field-for-field, so the GUI loads, draws, simulates and re-saves the
+/// Omitted when empty, so a design with no board wiring round-trips
+/// byte-for-byte against the GUI's own exports — which is what the golden
+/// tests check. `fpga_core::designfile::LoopbackLink` matches this
+/// field-for-field, so the GUI loads, draws, simulates and re-saves the
 /// wiring. See `docs/loop-around.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopbackLink {
@@ -67,7 +66,10 @@ struct FileSchema {
     /// Keys "col".
     #[serde(default)]
     csbs: BTreeMap<String, BTreeMap<String, u64>>,
-    /// Keys "clb:col,row" / "csb:col".
+    /// The IO controller's non-zero fields; omitted when all are zero.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    io: BTreeMap<String, u64>,
+    /// Keys "clb:col,row" / "csb:col" / "io".
     #[serde(default)]
     pinned: BTreeMap<String, String>,
     #[serde(default)]
@@ -95,6 +97,7 @@ struct FabricRef {
     columns: usize,
     rows: usize,
     clb_bits: usize,
+    io_bits: usize,
     csb_bits: usize,
 }
 
@@ -105,6 +108,7 @@ impl FabricRef {
             columns: fabric.columns,
             rows: fabric.rows,
             clb_bits: fabric.clb_bits(),
+            io_bits: fabric.io_bits(),
             csb_bits: fabric.csb_bits(),
         }
     }
@@ -154,6 +158,13 @@ pub fn save_design(fabric: &Fabric, design: &Design, file: &DesignFile) -> Strin
             csbs.insert(col.to_string(), fields);
         }
     }
+    let mut io = BTreeMap::new();
+    for (i, field) in fabric.io_fields.iter().enumerate() {
+        let v = design.io().get(i);
+        if v != 0 {
+            io.insert(field.name.clone(), v);
+        }
+    }
     let pinned: BTreeMap<String, String> =
         design.names().map(|(b, n)| (b.json_key(), n.clone())).collect();
 
@@ -163,6 +174,7 @@ pub fn save_design(fabric: &Fabric, design: &Design, file: &DesignFile) -> Strin
         name: file.name.clone(),
         clbs,
         csbs,
+        io,
         pinned,
         stimulus: file.stimulus.clone(),
         tick: file.tick,
@@ -183,28 +195,37 @@ pub fn load_design(
     path: &Path,
 ) -> Result<(Design, DesignFile), DesignFileError> {
     let fail = |message: String| DesignFileError { path: path.to_path_buf(), message };
-    let schema: FileSchema =
-        serde_json::from_str(src).map_err(|e| fail(format!("not a valid design file: {}", e)))?;
-    if schema.version != FILE_VERSION {
+    #[derive(Deserialize)]
+    struct VersionOnly {
+        version: u32,
+    }
+    let version = serde_json::from_str::<VersionOnly>(src)
+        .map_err(|e| fail(format!("not a valid design file: {}", e)))?
+        .version;
+    if version != FILE_VERSION {
         return Err(fail(format!(
             "design file version {} is not supported (this build reads version {})",
-            schema.version, FILE_VERSION
+            version, FILE_VERSION
         )));
     }
+    let schema: FileSchema =
+        serde_json::from_str(src).map_err(|e| fail(format!("not a valid design file: {}", e)))?;
     let current = FabricRef::of(fabric);
     if schema.fabric != current {
         return Err(fail(format!(
-            "design was saved against fabric \"{}\" ({}x{}, {} CLB bits, {} CSB bits); \
-             the loaded fabric is \"{}\" ({}x{}, {} CLB bits, {} CSB bits)",
+            "design was saved against fabric \"{}\" ({}x{}, {}/{}/{} CLB/IO/CSB bits); \
+             the loaded fabric is \"{}\" ({}x{}, {}/{}/{} CLB/IO/CSB bits)",
             schema.fabric.name,
             schema.fabric.columns,
             schema.fabric.rows,
             schema.fabric.clb_bits,
+            schema.fabric.io_bits,
             schema.fabric.csb_bits,
             current.name,
             current.columns,
             current.rows,
             current.clb_bits,
+            current.io_bits,
             current.csb_bits
         )));
     }
@@ -228,12 +249,16 @@ pub fn load_design(
             design.set_csb(fabric, col, name, value).map_err(|e| fail(e.message))?;
         }
     }
+    for (name, &value) in &schema.io {
+        design.set_io(fabric, name, value).map_err(|e| fail(e.message))?;
+    }
     for (key, name) in &schema.pinned {
         let block = parse_block_key(key)
             .ok_or_else(|| fail(format!("pinned name \"{}\" has an unrecognised key", key)))?;
         let in_grid = match block {
             BlockId::Clb { col, row } => col < fabric.columns && row < fabric.rows,
             BlockId::Csb { col } => col < fabric.columns,
+            BlockId::Io => true,
         };
         if !in_grid {
             return Err(fail(format!("pinned name \"{}\" names a block outside the grid", name)));
@@ -266,6 +291,9 @@ fn parse_block_key(key: &str) -> Option<BlockId> {
     }
     if let Some(rest) = key.strip_prefix("csb:") {
         return rest.trim().parse().ok().map(|col| BlockId::Csb { col });
+    }
+    if key == "io" {
+        return Some(BlockId::Io);
     }
     None
 }

@@ -79,6 +79,7 @@ fn utilisation_figures_are_consistent() {
         ("input pads", u.in_pads_used, u.in_pads),
         ("output pads", u.out_pads_used, u.out_pads),
         ("loop wires", u.loops_used, u.loops_pool),
+        ("on-chip loops", u.on_chip_used, u.on_chip_lanes),
     ] {
         assert!(used <= total, "{}: {} used exceeds capacity {}", label, used, total);
         assert!(total > 0, "{}: capacity should not be zero on this fabric", label);
@@ -98,9 +99,10 @@ fn utilisation_figures_are_consistent() {
         "the per-column grid must account for every vertical segment"
     );
 
-    // count4 is the design that needs board wiring, so it exercises the pads
-    // that pin assignment never sees.
-    assert!(u.loops_used > 0, "count4 should need loop-around wiring");
+    // count4 feeds every bit back to its own adder cell, so it exercises the
+    // loops that pin assignment never sees — on-chip, since those cost less
+    // than board wiring.
+    assert!(u.on_chip_used + u.loops_used > 0, "count4 needs some way back");
     assert!(u.registers > 0 && u.carry_cells > 0, "count4 has registers and a carry chain");
 }
 
@@ -130,6 +132,7 @@ fn every_resource_reports_absolute_and_percentage() {
         "vertical segments",
         "input pads",
         "output pads",
+        "on-chip loops",
         "loop-around wires",
     ] {
         let line = table

@@ -1,4 +1,4 @@
-//! Headless CLI: `fpgatool build`, `check`, `import`, `diff`. All failure
+//! Headless CLI: `pnrgui build`, `check`, `import`, `diff`. All failure
 //! paths print a message and return a non-zero exit code; nothing panics on
 //! malformed input.
 
@@ -10,15 +10,15 @@ use fpga_core::fabric::Fabric;
 use std::path::{Path, PathBuf};
 
 pub const USAGE: &str = "\
-fpgatool — SR-GA1 fabric configuration tool
+pnrgui — SR-GA1 fabric configuration tool
 
 USAGE:
-  fpgatool                          launch the GUI
-  fpgatool <design.json>            launch the GUI with a design loaded
-  fpgatool build <design.json> -o <bits.txt> [--raw] [--wrap N] [--fabric <fabric.toml>]
-  fpgatool check <design.json> [--fabric <fabric.toml>]
-  fpgatool import <bits.txt> -o <design.json> [--name <name>] [--fabric <fabric.toml>]
-  fpgatool diff <a.json> <b.json> [--fabric <fabric.toml>]
+  pnrgui                          launch the GUI
+  pnrgui <design.json>            launch the GUI with a design loaded
+  pnrgui build <design.json> -o <bits.txt> [--raw] [--wrap N] [--fabric <fabric.toml>]
+  pnrgui check <design.json> [--fabric <fabric.toml>]
+  pnrgui import <bits.txt> -o <design.json> [--name <name>] [--fabric <fabric.toml>]
+  pnrgui diff <a.json> <b.json> [--fabric <fabric.toml>]
 
   build    export the design's bitstream (exit 1 on any error)
   check    run design rule checks; exit 1 if any DRC error is found
@@ -107,11 +107,15 @@ fn run_inner(cmd: &str, rest: &[String]) -> Result<i32, String> {
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
             let text = bitstream::format_text(&fabric, &file.design, &file.name, &timestamp, args.raw, args.wrap);
             std::fs::write(&out_path, text).map_err(|e| format!("cannot write {}: {}", out_path.display(), e))?;
-            println!(
-                "wrote {} bits to {}",
-                fabric.total_bits(),
-                out_path.display()
-            );
+            match fabric.start_bit {
+                Some(_) => println!(
+                    "wrote {} bits (start bit + {} configuration bits) to {}",
+                    fabric.stream_bits(),
+                    fabric.total_bits(),
+                    out_path.display()
+                ),
+                None => println!("wrote {} bits to {}", fabric.total_bits(), out_path.display()),
+            }
             Ok(0)
         }
         "check" => {
@@ -166,24 +170,16 @@ fn run_inner(cmd: &str, rest: &[String]) -> Result<i32, String> {
             let mut differences = 0;
             for block in a.design.blocks() {
                 let mut lines = Vec::new();
-                match block {
-                    BlockId::Clb { col, row } => {
-                        for f in &fabric.clb_fields {
-                            let va = a.design.get_clb(&fabric, col, row, &f.name).unwrap_or(0);
-                            let vb = b.design.get_clb(&fabric, col, row, &f.name).unwrap_or(0);
-                            if va != vb {
-                                lines.push(format!("  {}: {} -> {}", f.name, va, vb));
-                            }
-                        }
-                    }
-                    BlockId::Csb { col } => {
-                        for f in &fabric.csb_fields {
-                            let va = a.design.get_csb(&fabric, col, &f.name).unwrap_or(0);
-                            let vb = b.design.get_csb(&fabric, col, &f.name).unwrap_or(0);
-                            if va != vb {
-                                lines.push(format!("  {}: {} -> {}", f.name, va, vb));
-                            }
-                        }
+                let fields = match block {
+                    BlockId::Clb { .. } => &fabric.clb_fields,
+                    BlockId::Csb { .. } => &fabric.csb_fields,
+                    BlockId::Io => &fabric.io_fields,
+                };
+                for (i, f) in fields.iter().enumerate() {
+                    let va = a.design.block(block).get(i);
+                    let vb = b.design.block(block).get(i);
+                    if va != vb {
+                        lines.push(format!("  {}: {} -> {}", f.name, va, vb));
                     }
                 }
                 let pa = a.design.pinned_name(block);

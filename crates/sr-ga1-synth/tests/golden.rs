@@ -2,7 +2,7 @@
 //!
 //! The synthesiser and the visual programmer share no code, so the only
 //! thing keeping their two file formats identical is this test: take files
-//! the GUI exported, read them with this tool, write them back, and require
+//! the GUI wrote, read them with this tool, write them back, and require
 //! byte-for-byte equality. If either side changes its schema, this fails
 //! loudly instead of producing a design file the GUI silently mis-reads.
 
@@ -32,12 +32,16 @@ fn golden(name: &str) -> (PathBuf, String) {
 fn fabric_matches_the_documented_geometry() {
     let f = fabric();
     assert_eq!(f.name, "SR-GA1");
-    assert_eq!((f.columns, f.rows), (7, 4));
-    assert_eq!(f.clb_bits(), 20);
+    assert_eq!((f.columns, f.rows), (8, 4));
+    assert_eq!(f.clb_bits(), 25);
+    assert_eq!(f.io_bits(), 64);
     assert_eq!(f.csb_bits(), 3);
-    assert_eq!(f.total_bits(), 581);
-    assert_eq!(f.operations.len(), 8);
-    assert_eq!(f.operation("MUX2").map(|o| o.code), Some(7));
+    assert_eq!(f.total_bits(), 888);
+    assert_eq!(f.start_bit, Some(true));
+    assert_eq!(f.stream_bits(), 889);
+    // The RTL indexes lut[{a, b, c}]: input a is the most significant bit.
+    assert_eq!(f.lut_value(|v| v[0]), 0xF0);
+    assert_eq!(f.preset_name(0xE4), Some("MUX2"));
 }
 
 #[test]
@@ -72,7 +76,8 @@ fn raw_mode_emits_bits_only() {
 
     let raw = bitstream::format_text(&f, &design, &file.name, "unused", true);
     assert!(!raw.starts_with('#'));
-    assert_eq!(raw.trim_end().len(), f.total_bits());
+    assert_eq!(raw.trim_end().len(), f.stream_bits());
+    assert!(raw.starts_with('1'), "the start bit leads");
 }
 
 #[test]
@@ -82,7 +87,7 @@ fn bitstream_round_trips_through_the_decoder() {
     let (design, _) = load_design(&f, &json, &path).expect("golden design file must load");
 
     let bits = bitstream::export_bits(&f, &design);
-    assert_eq!(bits.len(), f.total_bits());
+    assert_eq!(bits.len(), f.stream_bits());
     let decoded = bitstream::import_bits(&f, &bits).expect("a freshly exported bitstream decodes");
     assert_eq!(bitstream::export_bits(&f, &decoded), bits);
 
@@ -95,6 +100,7 @@ fn bitstream_round_trips_through_the_decoder() {
 #[test]
 fn a_wrong_length_bitstream_is_refused() {
     let f = fabric();
-    let err = bitstream::import_bits(&f, &vec![false; f.total_bits() - 1]).unwrap_err();
-    assert!(err.message.contains("581"), "message should quote the expected length: {}", err);
+    let err = bitstream::import_bits(&f, &vec![false; f.total_bits()]).unwrap_err();
+    assert!(err.message.contains("889"), "message should quote the expected length: {}", err);
+    assert!(err.message.contains("start bit"), "and explain the extra bit: {}", err);
 }

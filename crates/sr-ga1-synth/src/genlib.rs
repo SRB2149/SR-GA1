@@ -1,26 +1,26 @@
 //! The cell library, derived from `fabric.toml`.
 //!
-//! The fabric has no LUT: it has eight fixed functions over three selected
-//! inputs, so technology mapping is standard-cell mapping. This module turns
-//! the operation tables in the fabric description into two things:
+//! The CLB computes its result with a lookup table over three selected
+//! inputs, so every function of up to three inputs costs exactly one CLB. This
+//! module turns that into two things:
 //!
-//! 1. a genlib ABC can map against, one gate per distinct *function*; and
-//! 2. for each gate, every *physical* way to build it — which operation code,
-//!    which physical input each gate pin sits on, and which physical inputs
-//!    must be tied to a constant.
+//! 1. a genlib ABC can map against, one gate per distinct *function* that
+//!    depends on all of its pins; and
+//! 2. for each gate, every *physical* way to build it — which physical input
+//!    each gate pin sits on, and the LUT value that computes the function from
+//!    there.
 //!
-//! The second list is what makes Phase 6 able to re-map a cell whose
-//! constant turned out to be unroutable instead of failing the whole run.
-//! Degrading on physical `c` is cheap (its mux reaches two major lanes),
-//! degrading on `a` is expensive (its mux sees only the two minor lanes,
-//! which carry no constant outside row 3), so implementations are ordered by
-//! what their constants actually cost.
+//! The second list is what lets placement move a pin to whichever input mux
+//! can actually see the lane its signal arrives on. Input `a` reads only the
+//! two minor lanes, `b` straddles a minor and a major lane, and `c` reaches the
+//! major lanes, the vertical ring and the carry chain, so where a pin sits
+//! decides what it can be fed by. An input a function does not use is simply
+//! a don't-care: a LUT ignores it, so nothing has to be tied off.
 //!
-//! Nothing here is hard-coded per operation: a fabric edit that changes,
-//! adds or removes an operation regenerates the library.
+//! The LUT's bit order comes from the fabric (`[clb.lut] index`), so nothing
+//! here assumes which input is the most significant.
 
-use crate::fabric::{Fabric, Source};
-use std::collections::BTreeMap;
+use crate::fabric::Fabric;
 use std::fmt::Write as _;
 
 /// What one physical CLB input carries in a particular implementation.
@@ -28,31 +28,20 @@ use std::fmt::Write as _;
 pub enum PhysIn {
     /// Gate pin `k` of the mapped cell.
     Pin(usize),
-    /// Tied to a constant, which the router must deliver to this input.
-    Const(bool),
-    /// The operation ignores this input: any legal source will do, and no
-    /// constant needs routing.
+    /// The LUT ignores this input: any legal source will do.
     DontCare,
 }
 
-/// One physical realisation of a gate: an operation code plus an assignment
-/// for each physical input, in the fabric's input mux order (`a`, `b`, `c`).
+/// One physical realisation of a gate: where each pin sits, in the fabric's
+/// input mux order (`a`, `b`, `c`), and the LUT value that computes the gate's
+/// function from those positions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CellImpl {
-    pub op_code: u64,
-    pub op_name: String,
+    pub lut: u64,
     pub inputs: Vec<PhysIn>,
 }
 
 impl CellImpl {
-    /// Physical inputs that must be driven with a constant.
-    pub fn constants(&self) -> impl Iterator<Item = (usize, bool)> + '_ {
-        self.inputs.iter().enumerate().filter_map(|(i, p)| match p {
-            PhysIn::Const(v) => Some((i, *v)),
-            _ => None,
-        })
-    }
-
     /// Physical input carrying a given gate pin.
     pub fn input_of_pin(&self, pin: usize) -> Option<usize> {
         self.inputs.iter().position(|p| *p == PhysIn::Pin(pin))
@@ -74,20 +63,16 @@ pub struct LogicCell {
     /// Pin permutations that leave the function unchanged — the freedom the
     /// packer has when matching pins to the restricted input windows.
     pub symmetries: Vec<Vec<usize>>,
-    /// Physical realisations, cheapest constants first.
+    /// Physical realisations: every placement of the pins on distinct inputs.
     pub impls: Vec<CellImpl>,
 }
 
 impl LogicCell {
-    /// Implementations that accept a live pin on `phys_input`, cheapest
-    /// constants first.
+    /// Implementations that accept a live pin on `phys_input`.
     ///
-    /// Which form to build a cell in is a routing-time question, not a fixed
-    /// ranking: the best buffer is the one whose live pin already sits on the
-    /// lane the signal arrived on. A chip input entering row 0 on lane 0 can
-    /// only reach input `a`, and `OR3(a, 0, 0)` buffers it without the signal
-    /// changing lane at all — whereas the globally cheapest form would move
-    /// it onto a major lane first.
+    /// The best buffer is the one whose live pin already sits on the input
+    /// the signal arrived at, so this is a routing-time question rather than a
+    /// fixed ranking.
     pub fn impls_for_input(&self, phys_input: usize) -> Vec<&CellImpl> {
         self.impls.iter().filter(|i| i.takes_pin_on(phys_input)).collect()
     }
@@ -123,7 +108,7 @@ impl LogicCell {
 #[derive(Debug, Clone)]
 pub struct CellLibrary {
     pub cells: Vec<LogicCell>,
-    /// Number of physical inputs the operation core takes.
+    /// Number of physical inputs the LUT takes.
     pub phys_inputs: usize,
     /// Names of the physical inputs, in mux order.
     pub phys_names: Vec<String>,
@@ -134,128 +119,50 @@ impl CellLibrary {
         self.cells.iter().find(|c| c.name == name)
     }
 
-    /// Build the library by cofactoring every operation against every way of
-    /// tying its inputs to constants.
+    /// The single-input identity, which the router and packer build buffers
+    /// from.
+    pub fn buffer(&self) -> Option<&LogicCell> {
+        self.cells.iter().find(|c| c.arity == 1 && c.table == [false, true])
+    }
+
+    /// Build the library: every function of 1..=inputs pins that depends on
+    /// all of them, with every placement of its pins on distinct inputs.
     pub fn derive(fabric: &Fabric) -> CellLibrary {
         let phys = fabric.input_muxes.len();
-        let candidates = constant_lanes_per_input(fabric);
-
-        // Keyed by (arity, truth table) so every way of building the same
-        // function collapses into one gate with several implementations.
-        let mut found: BTreeMap<(usize, Vec<bool>), Vec<CellImpl>> = BTreeMap::new();
-
-        // Each physical input is either tied to a constant or driven by one of
-        // the gate's pins — and **two physical inputs may share a pin**. That
-        // last case is not a curiosity: `MUX2(p, p, -)` is a buffer needing no
-        // constant at all, and it is the only way to buffer a signal in a
-        // column or row where no constant can be reached. Enumerating only
-        // distinct pins would miss it.
-        const TIED_ZERO: usize = 0;
-        const TIED_ONE: usize = 1;
-        let first_pin = 2usize;
-        let options = first_pin + phys;
-
-        for op in &fabric.operations {
-            for pattern in 0..options.pow(phys as u32) {
-                let mut assign = Vec::with_capacity(phys);
-                let mut p = pattern;
-                for _ in 0..phys {
-                    assign.push(p % options);
-                    p /= options;
+        let mut cells = Vec::new();
+        for arity in 1..=phys {
+            let placements = injections(arity, phys);
+            for bits in 0u64..1 << (1 << arity) {
+                let table: Vec<bool> = (0..1 << arity).map(|i| bits >> i & 1 != 0).collect();
+                if !(0..arity).all(|pin| depends_on(&table, arity, pin)) {
+                    continue; // a smaller function, or a constant
                 }
-                // Renumber the pins by first appearance, so the same wiring is
-                // only ever discovered once.
-                let mut pin_order: Vec<usize> = Vec::new();
-                for &a in &assign {
-                    if a >= first_pin && !pin_order.contains(&a) {
-                        pin_order.push(a);
-                    }
-                }
-                if pin_order.is_empty() {
-                    continue; // every input tied: a constant, not a cell
-                }
-                let pin_of = |a: usize| pin_order.iter().position(|&p| p == a);
-
-                // Cofactor: evaluate the operation with the ties applied and
-                // the shared pins driven together.
-                let arity = pin_order.len();
-                let mut table = vec![false; 1 << arity];
-                for (minterm, slot) in table.iter_mut().enumerate() {
-                    let mut index = 0usize;
-                    for (i, &a) in assign.iter().enumerate() {
-                        let value = match a {
-                            TIED_ZERO => false,
-                            TIED_ONE => true,
-                            _ => {
-                                let pin = pin_of(a).unwrap_or(0);
-                                minterm >> pin & 1 != 0
-                            }
-                        };
-                        if value {
-                            index |= 1 << i;
+                let impls = placements
+                    .iter()
+                    .map(|placement| {
+                        let mut inputs = vec![PhysIn::DontCare; phys];
+                        for (pin, &input) in placement.iter().enumerate() {
+                            inputs[input] = PhysIn::Pin(pin);
                         }
-                    }
-                    *slot = op.table[index];
-                }
-
-                // Pins the cofactor ignores cost nothing to drive.
-                let used: Vec<bool> =
-                    (0..arity).map(|pin| depends_on(&table, arity, pin)).collect();
-                if !used.iter().any(|&u| u) {
-                    continue; // a constant: no cell needed
-                }
-                // Dropping a pin the function ignores is only sound when one
-                // physical input drives it. If two share it, they still have to
-                // carry the *same* value — `XOR3(a, b, b)` is `a`, but only
-                // while b and c are tied together, which "don't care" does not
-                // say. Such a form needs a net routed to two inputs for no
-                // benefit, so discard it: the useful shared-pin case, where the
-                // shared pin is the signal itself, is unaffected.
-                let sound = (0..arity).all(|pin| {
-                    used[pin]
-                        || assign.iter().filter(|&&a| pin_of(a) == Some(pin)).count() == 1
-                });
-                if !sound {
-                    continue;
-                }
-                let (table, arity, kept) = restrict(&table, arity, &used);
-
-                let mut inputs = Vec::with_capacity(phys);
-                for &a in &assign {
-                    inputs.push(match a {
-                        TIED_ZERO => PhysIn::Const(false),
-                        TIED_ONE => PhysIn::Const(true),
-                        _ => {
-                            let pin = pin_of(a).unwrap_or(0);
-                            match kept.iter().position(|&k| k == pin) {
-                                Some(new_pin) => PhysIn::Pin(new_pin),
-                                None => PhysIn::DontCare,
-                            }
-                        }
-                    });
-                }
-                let cell_impl =
-                    CellImpl { op_code: op.code, op_name: op.name.clone(), inputs };
-                let entry = found.entry((arity, table)).or_default();
-                if !entry.contains(&cell_impl) {
-                    entry.push(cell_impl);
-                }
-            }
-        }
-
-        let mut cells: Vec<LogicCell> = found
-            .into_iter()
-            .map(|((arity, table), mut impls)| {
-                impls.sort_by_key(|i| (impl_cost(i, &candidates), i.op_code, i.inputs.clone()));
-                LogicCell {
+                        let lut = fabric.lut_value(|values| {
+                            let minterm = placement
+                                .iter()
+                                .enumerate()
+                                .fold(0usize, |acc, (pin, &input)| acc | usize::from(values[input]) << pin);
+                            table[minterm]
+                        });
+                        CellImpl { lut, inputs }
+                    })
+                    .collect();
+                cells.push(LogicCell {
                     name: cell_name(fabric, arity, &table),
                     arity,
                     symmetries: symmetries(&table, arity),
                     table,
                     impls,
-                }
-            })
-            .collect();
+                });
+            }
+        }
         cells.sort_by(|a, b| (a.arity, &a.name).cmp(&(b.arity, &b.name)));
 
         CellLibrary {
@@ -290,8 +197,8 @@ impl CellLibrary {
         out
     }
 
-    /// A human-readable dump of the physical realisations, for the report
-    /// and `--keep-intermediates`.
+    /// A human-readable dump of the physical realisations, for
+    /// `--keep-intermediates`.
     pub fn implementations_report(&self) -> String {
         let mut out = String::new();
         for cell in &self.cells {
@@ -305,140 +212,42 @@ impl CellLibrary {
                         let phys = self.phys_names.get(i).map(|s| s.as_str()).unwrap_or("?");
                         match p {
                             PhysIn::Pin(k) => format!("{}={}", phys, gate_pin_name(*k)),
-                            PhysIn::Const(v) => format!("{}={}", phys, u8::from(*v)),
                             PhysIn::DontCare => format!("{}=-", phys),
                         }
                     })
                     .collect();
-                let _ = writeln!(out, "    {:<6} {}", imp.op_name, assigns.join(" "));
+                let _ = writeln!(out, "    LUT 0x{:02X}  {}", imp.lut, assigns.join(" "));
             }
         }
         out
     }
 }
 
-/// What an input mux can select in order to see a constant: either a
-/// constant-capable horizontal lane, or a constant wired straight into the
-/// mux. Empty means no upstream CLB can hand this input a constant at all.
-fn constant_lanes_per_input(fabric: &Fabric) -> Vec<Vec<usize>> {
-    let const_lanes = fabric.const_capable_horz_lanes();
-    fabric
-        .input_muxes
-        .iter()
-        .map(|mux| {
-            mux.sources
-                .iter()
-                .filter_map(|s| match s {
-                    Source::HorzIn(l) if const_lanes.contains(l) => Some(*l),
-                    _ => None,
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// An input that can reach no constant-capable lane is only usable in a row
-/// whose IO map supplies the constant at the edge, so it must never be the
-/// first choice. Well clear of any real lane count.
-const UNREACHABLE_CONSTANT: u32 = 8;
-
-/// What an implementation's constants really cost: the number of distinct
-/// horizontal lanes that have to carry a constant for it.
-///
-/// This is not the number of tied inputs. The input mux windows overlap, so
-/// several tied inputs can share one lane — `b` sees `{h1, h2}` and `c` sees
-/// `{h2, h3, v0, carry}`, so tying both to 0 costs the *single* lane `h2`,
-/// not two. Since a lane carries one value, inputs tied to 0 and inputs tied
-/// to 1 must land on different lanes.
-///
-/// Arity is three, so this brute-forces the assignment rather than pretending
-/// to be a set cover solver.
-fn impl_cost(imp: &CellImpl, candidates: &[Vec<usize>]) -> u32 {
-    let mut wanted: Vec<(usize, bool)> = imp.constants().collect();
-    // Inputs no upstream CLB can reach are charged individually and dropped
-    // from the lane assignment.
-    let mut penalty = 0;
-    wanted.retain(|&(input, _)| {
-        let reachable = candidates.get(input).is_some_and(|l| !l.is_empty());
-        if !reachable {
-            penalty += UNREACHABLE_CONSTANT;
-        }
-        reachable
-    });
-    penalty + minimum_constant_lanes(&wanted, candidates)
-}
-
-/// Fewest distinct lanes that can carry every requested constant, where a
-/// lane may serve several inputs but only one value.
-fn minimum_constant_lanes(wanted: &[(usize, bool)], candidates: &[Vec<usize>]) -> u32 {
-    fn search(
-        wanted: &[(usize, bool)],
-        candidates: &[Vec<usize>],
-        chosen: &mut Vec<(usize, bool)>,
-        best: &mut u32,
-    ) {
-        let distinct = |chosen: &Vec<(usize, bool)>| {
-            let mut lanes: Vec<usize> = chosen.iter().map(|&(lane, _)| lane).collect();
-            lanes.sort_unstable();
-            lanes.dedup();
-            lanes.len() as u32
-        };
-        if distinct(chosen) >= *best {
-            return; // already no better than what we have
-        }
-        let Some(&(input, value)) = wanted.first() else {
-            *best = distinct(chosen);
+/// Every way to put `pins` gate pins on distinct physical inputs, as the
+/// input each pin lands on.
+fn injections(pins: usize, inputs: usize) -> Vec<Vec<usize>> {
+    fn extend(current: &mut Vec<usize>, pins: usize, inputs: usize, out: &mut Vec<Vec<usize>>) {
+        if current.len() == pins {
+            out.push(current.clone());
             return;
-        };
-        for &lane in &candidates[input] {
-            // A lane already carrying the other value cannot be reused.
-            if chosen.iter().any(|&(l, v)| l == lane && v != value) {
-                continue;
+        }
+        for input in 0..inputs {
+            if !current.contains(&input) {
+                current.push(input);
+                extend(current, pins, inputs, out);
+                current.pop();
             }
-            chosen.push((lane, value));
-            search(&wanted[1..], candidates, chosen, best);
-            chosen.pop();
         }
     }
-
-    if wanted.is_empty() {
-        return 0;
-    }
-    let mut best = u32::MAX;
-    search(wanted, candidates, &mut Vec::new(), &mut best);
-    // Unsatisfiable only if a value clash leaves no assignment, in which case
-    // the implementation needs a constant the fabric cannot place.
-    if best == u32::MAX {
-        UNREACHABLE_CONSTANT * wanted.len() as u32
-    } else {
-        best
-    }
+    let mut out = Vec::new();
+    extend(&mut Vec::new(), pins, inputs, &mut out);
+    out
 }
 
 /// Does the function actually depend on this pin?
 fn depends_on(table: &[bool], arity: usize, pin: usize) -> bool {
     let bit = 1 << pin;
     (0..1 << arity).any(|i| i & bit == 0 && table[i] != table[i | bit])
-}
-
-/// Drop the pins the function ignores, renumbering the rest.
-fn restrict(table: &[bool], arity: usize, used: &[bool]) -> (Vec<bool>, usize, Vec<usize>) {
-    let kept: Vec<usize> = (0..arity).filter(|&p| used[p]).collect();
-    if kept.len() == arity {
-        return (table.to_vec(), arity, kept);
-    }
-    let mut out = vec![false; 1 << kept.len()];
-    for (minterm, slot) in out.iter_mut().enumerate() {
-        let mut index = 0usize;
-        for (new_pin, &old_pin) in kept.iter().enumerate() {
-            if minterm >> new_pin & 1 != 0 {
-                index |= 1 << old_pin;
-            }
-        }
-        *slot = table[index];
-    }
-    let n = kept.len();
-    (out, n, kept)
 }
 
 /// Pin permutations that leave the truth table unchanged.
@@ -491,11 +300,17 @@ pub fn gate_pin_name(pin: usize) -> String {
 }
 
 /// Friendly names for the functions that actually turn up, so the report and
-/// the genlib read like a cell library rather than a hash dump.
+/// the genlib read like a cell library rather than a hash dump. A full-width
+/// function takes the fabric's preset name for the LUT value that computes it
+/// with pin k on input k, when there is one.
 fn cell_name(fabric: &Fabric, arity: usize, table: &[bool]) -> String {
     if arity == fabric.input_muxes.len() {
-        if let Some(op) = fabric.operations.iter().find(|o| o.table == table) {
-            return op.name.clone();
+        let lut = fabric.lut_value(|values| {
+            let minterm = (0..arity).fold(0usize, |acc, pin| acc | usize::from(values[pin]) << pin);
+            table[minterm]
+        });
+        if let Some(name) = fabric.preset_name(lut) {
+            return name.to_string();
         }
     }
     // Bit `i` of `bits` is the result at minterm `i`, so these patterns read
@@ -519,7 +334,7 @@ fn cell_name(fabric: &Fabric, arity: usize, table: &[bool]) -> String {
         .iter()
         .find(|&&(a, t, _)| a == arity && t == bits)
         .map(|&(_, _, n)| n.to_string())
-        .unwrap_or_else(|| format!("LOGIC{}_{:X}", arity, bits))
+        .unwrap_or_else(|| format!("LOGIC{}_{:02X}", arity, bits))
 }
 
 /// Minimal-ish sum of products over `*`, `+`, `!`, via prime implicants and a

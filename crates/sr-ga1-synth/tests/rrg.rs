@@ -2,7 +2,7 @@
 //! against the architectural facts directly, not against itself.
 
 use sr_ga1_synth::fabric::Fabric;
-use sr_ga1_synth::rrg::{EdgeKind, Node, Rrg};
+use sr_ga1_synth::rrg::{ConfigCell, EdgeKind, Node, Rrg};
 use std::path::{Path, PathBuf};
 
 fn fabric() -> Fabric {
@@ -203,12 +203,12 @@ fn the_enable_is_an_ordinary_routing_node() {
     assert_eq!(enable, Node::HSeg { row: 1, col: 3, lane: 3 });
     assert!(g.id(enable).is_some(), "the enable must be a real routing node");
 
-    // Row 3's lane 3 enters as a constant 1, which is why unconditional
-    // registers are cheapest there.
-    assert_eq!(f.io_constant(3, 3), Some(true));
-    assert_eq!(f.io_constant(3, 1), Some(true));
-    assert_eq!(f.io_constant(3, 0), Some(false));
-    assert_eq!(f.io_constant(0, 3), None, "row 0's lane 3 is a chip input");
+    // A constant 1 on lane 3 comes from the major mux to the left, so column 0
+    // — whose lane 3 is a chip input — can never hold a register enabled.
+    assert!(f.constant_reaches_lane(3, 1));
+    assert!(!f.constant_reaches_lane(3, 0));
+    assert!(reaches(&g, Node::Const(true), Node::HSeg { row: 2, col: 1, lane: 3 }));
+    assert!(!reaches(&g, Node::Const(true), Node::HSeg { row: 2, col: 0, lane: 3 }));
 }
 
 #[test]
@@ -263,17 +263,49 @@ inputs = [\"input_0\"]
     let g = Rrg::with_loopback(&f, &pool);
     let edges = g.loopback_edges();
     assert_eq!(edges.len(), 2, "two outputs times one input");
-    // output_2 is row 0 lane 2; input_0 is row 0 lane 0.
-    assert!(edges.contains(&(
-        Node::HSeg { row: 0, col: f.columns, lane: 2 },
-        Node::HSeg { row: 0, col: 0, lane: 0 }
-    )));
-    // output_6 is row 1 lane 2, so this edge also changes row - which is the
-    // other thing loop-around wiring buys.
-    assert!(edges.contains(&(
-        Node::HSeg { row: 1, col: f.columns, lane: 2 },
-        Node::HSeg { row: 0, col: 0, lane: 0 }
-    )));
+    let pad_out = |name: &str| Node::OutPad(f.output_pad(name).expect(name));
+    let pad_in = |name: &str| Node::InPad(f.input_pad(name).expect(name));
+    assert!(edges.contains(&(pad_out("output_2"), pad_in("input_0"))));
+    assert!(edges.contains(&(pad_out("output_6"), pad_in("input_0"))));
+}
+
+/// The IO controller reads `output_0..3` back onto any row's lane 0 or 1, so
+/// a value can return to the left edge with no board wiring at all.
+#[test]
+fn the_io_controller_closes_loops_on_chip() {
+    let f = fabric();
+    let g = Rrg::build(&f);
+    let edges = g.on_chip_edges();
+    // Four readable outputs, each onto lanes 0 and 1 of every row.
+    assert_eq!(edges.len(), 4 * 2 * f.rows);
+    let output_0 = Node::OutPad(f.output_pad("output_0").expect("output_0"));
+    assert!(edges.contains(&(output_0, Node::HSeg { row: 3, col: 0, lane: 1 })));
+    let output_4 = Node::OutPad(f.output_pad("output_4").expect("output_4"));
+    assert!(!edges.iter().any(|(from, _)| *from == output_4), "output_4 is not readable");
+    // So a register's value can get back to its own CLB without passing
+    // through any LUT: along its row, out on output_0..3, and back in.
+    assert!(routes_to(&g, Node::Reg { col: 3, row: 2 }, Node::In { col: 3, row: 2, mux: 0 }));
+}
+
+/// Whether `to` can be reached from `from` along wires and IO edges alone,
+/// spending no CLB.
+fn routes_to(g: &Rrg, from: Node, to: Node) -> bool {
+    let mut seen = vec![false; g.len()];
+    let mut stack = vec![g.id(from).expect("node")];
+    while let Some(id) = stack.pop() {
+        if g.node(id) == to {
+            return true;
+        }
+        if std::mem::replace(&mut seen[id], true) {
+            continue;
+        }
+        for edge in &g.out[id] {
+            if matches!(edge.kind, EdgeKind::Wire | EdgeKind::Drive | EdgeKind::OnChipLoop) {
+                stack.push(edge.to);
+            }
+        }
+    }
+    false
 }
 
 /// A pool that names a pad the fabric does not have, or only one end, is a
@@ -363,17 +395,27 @@ dir = \"c\"
 }
 
 #[test]
-fn pads_sit_at_the_documented_positions() {
+fn pads_reach_the_documented_lanes() {
     let f = fabric();
-    let inputs = Rrg::input_pads(&f);
-    let outputs = Rrg::output_pads(&f);
-    assert!(inputs.contains(&("input_0".into(), Node::HSeg { row: 0, col: 0, lane: 0 })));
-    assert!(inputs.contains(&("input_9".into(), Node::HSeg { row: 2, col: 0, lane: 1 })));
-    assert!(inputs.contains(&("ddio_in_0".into(), Node::HSeg { row: 2, col: 0, lane: 2 })));
-    assert!(outputs.contains(&("output_0".into(), Node::HSeg { row: 0, col: f.columns, lane: 0 })));
-    assert!(outputs.contains(&("ddio_dir_1".into(), Node::HSeg { row: 3, col: f.columns, lane: 1 })));
-    // Row 3 lanes 2 and 3 are unused on the output side.
-    assert!(!outputs.iter().any(|(_, n)| *n == Node::HSeg { row: 3, col: f.columns, lane: 3 }));
+    let g = Rrg::build(&f);
+    let pad_in = |name: &str| Node::InPad(f.input_pad(name).expect(name));
+    let pad_out = |name: &str| Node::OutPad(f.output_pad(name).expect(name));
+    let edge = |from: Node, to: Node| {
+        let id = g.id(from).expect("node");
+        g.out[id].iter().any(|e| g.node(e.to) == to)
+    };
+    // Every chip input reaches every row's lanes 0 and 1 through a mux...
+    assert!(edge(pad_in("input_9"), Node::HSeg { row: 0, col: 0, lane: 1 }));
+    assert!(edge(pad_in("input_0"), Node::HSeg { row: 3, col: 0, lane: 0 }));
+    // ...and some also have a fixed lane 2 or 3.
+    assert!(edge(pad_in("input_9"), Node::HSeg { row: 3, col: 0, lane: 3 }));
+    assert!(edge(pad_in("ddio_in_0"), Node::HSeg { row: 2, col: 0, lane: 2 }));
+    assert!(!edge(pad_in("input_0"), Node::HSeg { row: 0, col: 0, lane: 2 }));
+    // A muxed output reads any right-edge lane; a fixed one only its own.
+    assert!(edge(Node::HSeg { row: 3, col: f.columns, lane: 2 }, pad_out("output_0")));
+    assert!(edge(Node::HSeg { row: 1, col: f.columns, lane: 2 }, pad_out("output_4")));
+    assert!(!edge(Node::HSeg { row: 0, col: f.columns, lane: 0 }, pad_out("output_4")));
+    assert!(edge(Node::HSeg { row: 0, col: f.columns, lane: 0 }, pad_out("ddio_dir_1")));
 }
 
 #[test]
@@ -383,20 +425,27 @@ fn every_edge_names_a_configuration_write_unless_it_is_hard_wired() {
     for id in 0..g.len() {
         for edge in &g.out[id] {
             match edge.kind {
-                // Wiring decisions are configured.
-                EdgeKind::Wire | EdgeKind::Drive | EdgeKind::CarryChain => assert!(
-                    edge.assign.is_some(),
-                    "{} -> {} changes routing but writes no configuration",
-                    g.node(id),
-                    g.node(edge.to)
-                ),
-                // The operation core, the flip-flop and board wiring are not.
+                // Wiring decisions are configured, except a fixed IO pin.
+                EdgeKind::Wire | EdgeKind::Drive | EdgeKind::CarryChain | EdgeKind::OnChipLoop => {
+                    let fixed_pin = matches!(g.node(id), Node::InPad(_))
+                        || matches!(g.node(edge.to), Node::OutPad(_));
+                    assert!(
+                        edge.assign.is_some() || fixed_pin,
+                        "{} -> {} changes routing but writes no configuration",
+                        g.node(id),
+                        g.node(edge.to)
+                    )
+                }
+                // The LUT, the flip-flop and board wiring are not.
                 EdgeKind::Through | EdgeKind::Register | EdgeKind::Loopback => {
                     assert!(edge.assign.is_none())
                 }
             }
             if let Some(assign) = edge.assign {
-                assert!(assign.col < f.columns && assign.row < f.rows);
+                match assign.cell {
+                    ConfigCell::Clb { col, row } => assert!(col < f.columns && row < f.rows),
+                    ConfigCell::Io => assert!(assign.slice.field < f.io_fields.len()),
+                }
                 assert!(
                     assign.value < 1 << assign.slice.width,
                     "{} -> {} writes {} into {} select bits",

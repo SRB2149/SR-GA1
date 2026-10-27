@@ -8,17 +8,13 @@
 //!
 //! Four things here are specific to this fabric.
 //!
-//! * **Constants are nets, not annotations.** Every input tied to 0 belongs
-//!   to one shared constant net, so two inputs of the same cell tying to the
-//!   same value share one lane for free — which is exactly the hardware
-//!   truth, since input `b` and input `c` overlap on a major lane. The rows
-//!   whose IO map supplies a constant at the left edge start with those
-//!   segments already in the net, which is why row 3 gets its enables free.
-//! * **A buffer's constant is discovered while routing and satisfied in the
-//!   same pass.** Taking the operation core as a pass-through turns a spare
-//!   CLB into a buffer, and that buffer needs its own idle inputs
-//!   neutralised. Those become extra sinks on the constant nets, which are
-//!   routed last in the iteration, so no outer loop is needed.
+//! * **Constants are nets, not annotations.** A register enable held at 1, or
+//!   an unused DDIO's direction held at 0, is a sink on one shared constant
+//!   net per value, driven from the major muxes, so several sinks share a lane
+//!   wherever the hardware allows it.
+//! * **Taking a LUT as a pass-through turns a spare CLB into a buffer.** The
+//!   LUT is set to copy whichever input the signal arrived on and ignore the
+//!   other two, so a buffer needs nothing but the CLB itself.
 //! * **Some edges are not routes.** `_op -> _reg` crosses the flip-flop and
 //!   carries a different signal; the carry chain is produced and consumed by
 //!   the cells themselves. Both exist in the graph for the loop checker, and
@@ -53,8 +49,7 @@ pub struct Sink {
 pub struct Net {
     pub name: String,
     pub kind: NetKind,
-    /// Nodes the net already occupies at no cost: its driver, and for a
-    /// constant every segment the IO map supplies it on.
+    /// Nodes the net already occupies at no cost: its driver.
     pub roots: Vec<usize>,
     pub sinks: Vec<Sink>,
 }
@@ -63,13 +58,12 @@ pub struct Net {
 pub struct Problem {
     pub nets: Vec<Net>,
     /// `reserved[node] = Some(net)` means only that net may use the node —
-    /// a placed cell owns its own operation core and its operand pins.
+    /// a placed cell owns its own LUT and its operand pins.
     pub reserved: Vec<Option<usize>>,
     /// CLBs a placed cell occupies, indexed `row * columns + col`. A buffer
     /// can only be built where this is false.
     pub clb_used: Vec<bool>,
-    /// The net carrying each constant value, so a buffer discovered during
-    /// routing can add its neutralising constant as a sink on the right net.
+    /// The net carrying each constant value.
     pub const_net: [Option<usize>; 2],
 }
 
@@ -96,9 +90,8 @@ pub struct Buffer {
     pub input: usize,
     /// Net being buffered.
     pub net: usize,
-    /// Chosen implementation of the buffer cell.
-    pub op_code: u64,
-    pub op_name: String,
+    /// The LUT value that copies `input` through.
+    pub lut: u64,
     pub inputs: Vec<PhysIn>,
 }
 
@@ -153,9 +146,25 @@ impl Routing {
         out.dedup();
         out
     }
+
+    /// On-chip loops the routing uses, as `(output pad node, left-edge
+    /// segment, net)`: chip outputs the IO controller reads back.
+    pub fn on_chip_loops(&self, rrg: &Rrg) -> Vec<(Node, Node, usize)> {
+        let mut out = Vec::new();
+        for (net, route) in self.routes.iter().enumerate() {
+            for (from, edge) in &route.edges {
+                if edge.kind == EdgeKind::OnChipLoop {
+                    out.push((rrg.node(*from), rrg.node(edge.to), net));
+                }
+            }
+        }
+        out.sort_by_key(|(a, b, net)| (*a, *b, *net));
+        out.dedup();
+        out
+    }
 }
 
-/// Base cost of taking an edge. A pass-through is a wire; the operation core
+/// Base cost of taking an edge. A pass-through is a wire; the LUT
 /// is a whole CLB, and is priced to match.
 fn edge_base(kind: EdgeKind) -> f64 {
     match kind {
@@ -165,13 +174,20 @@ fn edge_base(kind: EdgeKind) -> f64 {
         // A board wire: no CLB and no configuration, but it consumes a scarce
         // input pad and has to physically exist, so it is far from free.
         EdgeKind::Loopback => 20.0,
+        // Reading a chip output back on-chip spends no CLB and needs no
+        // wiring, but there are only a few such outputs and they are shared
+        // with design outputs, so it is priced well above a wire.
+        EdgeKind::OnChipLoop => 12.0,
         // Neither is a route; `traversable` refuses them.
         EdgeKind::CarryChain | EdgeKind::Register => f64::INFINITY,
     }
 }
 
 fn traversable(kind: EdgeKind) -> bool {
-    matches!(kind, EdgeKind::Wire | EdgeKind::Drive | EdgeKind::Through | EdgeKind::Loopback)
+    matches!(
+        kind,
+        EdgeKind::Wire | EdgeKind::Drive | EdgeKind::Through | EdgeKind::Loopback | EdgeKind::OnChipLoop
+    )
 }
 
 pub struct Router<'a> {
@@ -183,9 +199,6 @@ pub struct Router<'a> {
     /// Which net currently holds each node, for sharing within a net.
     holder: Vec<Option<usize>>,
     buffer_at: BTreeMap<(usize, usize), Buffer>,
-    /// Sinks discovered while routing, addressed to another net. Rebuilt every
-    /// pass, since they belong to whichever buffers that pass allocated.
-    extra_sinks: BTreeMap<usize, Vec<Sink>>,
 }
 
 impl<'a> Router<'a> {
@@ -198,7 +211,6 @@ impl<'a> Router<'a> {
             history: vec![0.0; rrg.len()],
             holder: vec![None; rrg.len()],
             buffer_at: BTreeMap::new(),
-            extra_sinks: BTreeMap::new(),
         }
     }
 
@@ -209,9 +221,7 @@ impl<'a> Router<'a> {
         let mut present = 0.5f64;
         let mut unrouted = Vec::new();
 
-        // Signals first, constants last: a buffer allocated while routing a
-        // signal adds constant sinks, and they must be served in the same
-        // iteration.
+        // Clocks first, then signals, then constants.
         let order: Vec<usize> = {
             let mut ids: Vec<usize> = (0..problem.nets.len()).collect();
             ids.sort_by_key(|&i| match problem.nets[i].kind {
@@ -230,12 +240,8 @@ impl<'a> Router<'a> {
         // net blind to the ones routed after it, and the result oscillates.
         for pass in 1..=max_iterations {
             unrouted.clear();
-            // A buffer's neutralising constant is discovered while routing, so
-            // it belongs to the routing that allocated the buffer. The sinks are
-            // rebuilt each pass, or constants stay pinned to inputs the router
-            // has since stopped using and that reads as congestion that never
-            // clears.
-            self.extra_sinks.clear();
+            // Buffers belong to the routing that allocated them, so they are
+            // rebuilt each pass.
             self.buffer_at.clear();
 
             for &net_id in &order {
@@ -301,47 +307,12 @@ impl<'a> Router<'a> {
             self.claim(root, net_id, &mut route);
         }
 
-        // Owned, because serving one sink can discover more.
-        let mut pending: Vec<Sink> = net
-            .sinks
-            .iter()
-            .chain(self.extra_sinks.get(&net_id).into_iter().flatten())
-            .cloned()
-            .collect();
-        let mut index = 0;
-        while index < pending.len() {
-            let sink = pending[index].clone();
-            index += 1;
+        for sink in &net.sinks {
             if sink.options.iter().any(|&n| route.nodes.contains(&n)) {
                 continue; // already reached, often via a shared lane
             }
-            match self.search(&route, &sink, net_id, problem, present) {
-                Some(path) => {
-                    for (value, discovered) in self.commit(&path, net_id, &mut route) {
-                        // A buffer's idle input needs a constant, which belongs
-                        // to whichever net carries that value; an input sharing
-                        // the signal needs this same net, and is served straight
-                        // away by appending to this list.
-                        let target = match value {
-                            Some(v) => problem.const_net[usize::from(v)],
-                            None => Some(net_id),
-                        };
-                        let Some(target) = target else { continue };
-                        if target == net_id {
-                            if !pending.iter().any(|s| s.options == discovered.options) {
-                                pending.push(discovered);
-                            }
-                            continue;
-                        }
-                        let already = self
-                            .extra_sinks
-                            .get(&target)
-                            .is_some_and(|s| s.iter().any(|e| e.options == discovered.options));
-                        if !already {
-                            self.extra_sinks.entry(target).or_default().push(discovered);
-                        }
-                    }
-                }
+            match self.search(&route, sink, net_id, problem, present) {
+                Some(path) => self.commit(&path, net_id, &mut route),
                 None => failures.push(Unreached {
                     net: net_id,
                     net_name: net.name.clone(),
@@ -463,19 +434,14 @@ impl<'a> Router<'a> {
         }
         if edge.kind == EdgeKind::Through {
             // Spending a CLB as a buffer is only possible where no cell is
-            // placed, and only if a buffer implementation exists for the
-            // input the signal arrived on.
+            // placed.
             let Node::Op { col, row } = self.rrg.node(edge.to) else { return false };
             if problem.clb_is_used(self.rrg.columns, col, row) {
                 return false;
             }
             let Node::In { mux, .. } = self.rrg.node(from) else { return false };
-            // A buffer is only usable if its idle inputs can actually be
-            // neutralised *here*. At column 0 no upstream CLB exists to drive
-            // a constant onto a major lane, so most forms are unavailable.
-            return self
-                .buffer_impl(mux, col, row, self.arriving_lane(predecessor))
-                .is_some();
+            let _ = predecessor;
+            return self.buffer_impl(mux).is_some();
         }
         true
     }
@@ -483,35 +449,14 @@ impl<'a> Router<'a> {
     fn step_cost(
         &self,
         edge: &Edge,
-        from: usize,
+        _from: usize,
         net: usize,
         present: f64,
-        predecessor: Option<Node>,
+        _predecessor: Option<Node>,
         own: &NetRoute,
     ) -> f64 {
         let target = edge.to;
-        let mut base = edge_base(edge.kind);
-        if edge.kind == EdgeKind::Through {
-            // Charge the buffer's own constants, so a form that needs none is
-            // preferred over one that competes for a major lane.
-            if let (Node::In { mux, .. }, Node::Op { col, row }) =
-                (self.rrg.node(from), self.rrg.node(target))
-            {
-                if let Some(imp) = self.buffer_impl(mux, col, row, self.arriving_lane(predecessor))
-                {
-                    base += 4.0 * imp.constants().count() as f64;
-                    // A form that drives several inputs from one signal needs
-                    // that signal on more than one lane.
-                    let shared = imp
-                        .inputs
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, p)| *i != mux && matches!(p, PhysIn::Pin(_)))
-                        .count();
-                    base += 6.0 * shared as f64;
-                }
-            }
-        }
+        let base = edge_base(edge.kind);
         // Sharing within a net is free: that is what makes one constant lane
         // serve many sinks.
         if own.nodes.contains(&target) {
@@ -524,85 +469,15 @@ impl<'a> Router<'a> {
         (base + self.history[target]) * (1.0 + present * overuse)
     }
 
-    /// Cheapest buffer implementation whose live pin sits on `phys_input` and
-    /// whose tied inputs can be given a constant at this position.
-    ///
-    /// The position check is what stops the router allocating a buffer in
-    /// column 0, where no upstream CLB exists to drive a constant onto a major
-    /// lane and the buffer would be unroutable.
-    fn buffer_impl(
-        &self,
-        phys_input: usize,
-        col: usize,
-        row: usize,
-        arriving_lane: Option<usize>,
-    ) -> Option<&crate::genlib::CellImpl> {
-        let buf = self
-            .library
-            .cells
-            .iter()
-            .find(|c| c.arity == 1 && c.table == [false, true])?;
-        buf.impls_for_input(phys_input).into_iter().find(|imp| {
-            let constants_ok = imp
-                .constants()
-                .all(|(input, value)| self.fabric.constant_reaches_input(input, col, row, value));
-            // A form that drives several physical inputs from one signal is
-            // only usable when a single lane segment can feed all of them,
-            // since that is what the signal actually arrives on. `MUX2(p, p, -)`
-            // qualifies because inputs `a` and `b` overlap on one lane — and it
-            // is the only buffer needing no constant, so it is the only way to
-            // buffer where no constant can be reached, such as column 0 outside
-            // the row whose edge supplies constants.
-            constants_ok && self.shared_pins_reachable(imp, arriving_lane)
-        })
+    /// The buffer implementation whose live pin sits on `phys_input`: a LUT
+    /// copying that input and ignoring the others.
+    fn buffer_impl(&self, phys_input: usize) -> Option<&crate::genlib::CellImpl> {
+        self.library.buffer()?.impls_for_input(phys_input).into_iter().next()
     }
 
-    /// Whether the inputs an implementation drives from one signal can all be
-    /// fed by the segment the signal actually arrived on.
-    ///
-    /// The arrival lane matters, not just the mux window: a signal reaching
-    /// input `c` from the vertical ring is on no horizontal lane at all, so
-    /// nothing can share it, even though `c` and `b` do overlap on a lane in
-    /// general.
-    fn shared_pins_reachable(
-        &self,
-        imp: &crate::genlib::CellImpl,
-        arriving_lane: Option<usize>,
-    ) -> bool {
-        let driven = imp.inputs.iter().filter(|p| matches!(p, PhysIn::Pin(_))).count();
-        if driven <= 1 {
-            return true;
-        }
-        // Several inputs share the signal, so it has to be on a horizontal
-        // lane every one of them can select.
-        let Some(lane) = arriving_lane else { return false };
-        imp.inputs.iter().enumerate().all(|(input, phys)| {
-            !matches!(phys, PhysIn::Pin(_))
-                || self.fabric.input_muxes[input]
-                    .sources
-                    .contains(&crate::fabric::Source::HorzIn(lane))
-        })
-    }
-
-    /// The horizontal lane a signal is on, if it arrived on one.
-    fn arriving_lane(&self, predecessor: Option<Node>) -> Option<usize> {
-        match predecessor {
-            Some(Node::HSeg { lane, .. }) => Some(lane),
-            _ => None,
-        }
-    }
-
-    /// Take a path, claiming its nodes. Returns constant sinks that any
-    /// buffer on the path now needs.
-    fn commit(
-        &mut self,
-        path: &[(usize, Edge)],
-        net: usize,
-        route: &mut NetRoute,
-    ) -> Vec<(Option<bool>, Sink)> {
-        let mut discovered = Vec::new();
-        for (step, &(from, edge)) in path.iter().enumerate() {
-            let predecessor = step.checked_sub(1).map(|p| self.rrg.node(path[p].0));
+    /// Take a path, claiming its nodes and recording any buffer it spends.
+    fn commit(&mut self, path: &[(usize, Edge)], net: usize, route: &mut NetRoute) {
+        for &(from, edge) in path {
             self.claim(from, net, route);
             self.claim(edge.to, net, route);
             route.edges.push((from, edge));
@@ -610,75 +485,15 @@ impl<'a> Router<'a> {
                 if let (Node::Op { col, row }, Node::In { mux, .. }) =
                     (self.rrg.node(edge.to), self.rrg.node(from))
                 {
-                    if let Some(imp) =
-                        self.buffer_impl(mux, col, row, self.arriving_lane(predecessor)).cloned()
-                    {
-                        for (input, value) in imp.constants() {
-                            if let Some(id) = self.rrg.id(Node::In { col, row, mux: input }) {
-                                discovered.push((
-                                    Some(value),
-                                    Sink {
-                                        what: format!(
-                                            "buffer at CLB({}, {}) input {}",
-                                            col,
-                                            row,
-                                            self.phys_name(input)
-                                        ),
-                                        options: vec![id],
-                                    },
-                                ));
-                            }
-                        }
-                        // Some buffer forms drive several physical inputs from
-                        // the same signal — `MUX2(p, p, -)` is the only way to
-                        // buffer where no constant can be reached. Those inputs
-                        // are extra sinks on the *same* net, and leaving them
-                        // out would quietly compute the wrong function.
-                        for (input, phys) in imp.inputs.iter().enumerate() {
-                            if input == mux || !matches!(phys, PhysIn::Pin(_)) {
-                                continue;
-                            }
-                            if let Some(id) = self.rrg.id(Node::In { col, row, mux: input }) {
-                                discovered.push((
-                                    None,
-                                    Sink {
-                                        what: format!(
-                                            "buffer at CLB({}, {}) input {} (shared with {})",
-                                            col,
-                                            row,
-                                            self.phys_name(input),
-                                            self.phys_name(mux)
-                                        ),
-                                        options: vec![id],
-                                    },
-                                ));
-                            }
-                        }
+                    if let Some(imp) = self.buffer_impl(mux).cloned() {
                         self.buffer_at.insert(
                             (col, row),
-                            Buffer {
-                                col,
-                                row,
-                                input: mux,
-                                net,
-                                op_code: imp.op_code,
-                                op_name: imp.op_name.clone(),
-                                inputs: imp.inputs.clone(),
-                            },
+                            Buffer { col, row, input: mux, net, lut: imp.lut, inputs: imp.inputs },
                         );
                     }
                 }
             }
         }
-        discovered
-    }
-
-    fn phys_name(&self, input: usize) -> String {
-        self.library
-            .phys_names
-            .get(input)
-            .cloned()
-            .unwrap_or_else(|| input.to_string())
     }
 
     pub fn fabric(&self) -> &Fabric {

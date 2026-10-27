@@ -1,40 +1,40 @@
 # fabric.toml — SR-GA1 fabric description
 #
-# Single source of truth for the FPGA tool. The application never reads the
-# SystemVerilog: every dimension, config field, mux legality table and the
-# bitstream ordering comes from this file. It is validated on load with
+# Single source of truth for the FPGA tools. Neither pnrgui nor sr-ga1-synth
+# reads the SystemVerilog: every dimension, config field, mux legality table
+# and the bitstream ordering comes from this file. It is validated on load with
 # line-referenced errors, so hand edits that break an invariant are reported
-# rather than silently misconfiguring the tool.
+# rather than silently misconfiguring the tools.
 #
-# Source tokens used in the mux tables below. A mux's `sources` are listed in
-# select-code order: sources[k] is what the mux drives when its select field
+# Source tokens used in the CLB mux tables below. A mux's `sources` are listed
+# in select-code order: sources[k] is what the mux drives when its select field
 # holds the value k.
 #
 #   h_in:N    incoming horizontal bus, lane N   (pass-through: net name continues)
 #   v_in:N    incoming vertical bus, lane N     (pass-through: net name continues)
 #   const:0   constant zero -> reserved net named by naming.constant_zero
 #   const:1   constant one  -> reserved net named by naming.constant_one
-#   op        this CLB's combinational operation result -> new net <CLB>_op
-#   reg       this CLB's flip-flop output               -> new net <CLB>_reg
-#   carry     this CLB's carry output                   -> new net <CLB>_carry
+#   op        this CLB's LUT result                -> new net <CLB>_op
+#   reg       this CLB's flip-flop output          -> new net <CLB>_reg
+#   carry     this CLB's carry output              -> new net <CLB>_carry
 #   carry_in  the dedicated carry chain input, from the cell below
 #             (pass-through: carries that cell's <CLB>_carry name)
 #   v_ring:N  (CSB only) the column's vertical ring at the loop tap, lane N
 
-schema = 1
+schema = 2
 
 [fabric]
 name = "SR-GA1"
-# Grid size. 7x4 today; 12x4 and 16x4 must work by editing only `columns`.
+# Grid size. 8x4 today; 12x4 and 16x4 must work by editing only `columns`.
 # The [io] maps are written one line per row, so changing `rows` also means
 # editing those. Everything else (CSB count, bus segments, bitstream length)
 # derives from these two numbers.
-columns = 7
+columns = 8
 rows = 4
 
 [buses]
-# Horizontal lanes per row, flowing left (input controller) to right (output
-# controller), segmented at every CLB.
+# Horizontal lanes per row, flowing left (IO controller inputs) to right (IO
+# controller outputs), segmented at every CLB.
 horizontal = 4
 # Vertical lanes per column, flowing row 0 upward and then looping from the
 # top row back into row 0 — a closed ring. The CSB taps the ring at that loop
@@ -51,7 +51,7 @@ fields = [
     { name = "input_mux_a_sel", width = 1 },
     { name = "input_mux_b_sel", width = 1 },
     { name = "input_mux_c_sel", width = 2 },
-    { name = "operation_select", width = 3 },
+    { name = "lut", width = 8 },
     { name = "minor_horz_sel", width = 2 },
     { name = "minor_vert_sel", width = 4 },
     { name = "major_horz2_sel", width = 3 },
@@ -59,8 +59,8 @@ fields = [
     { name = "op_ff_reset_val", width = 1 },
 ]
 
-# The three operation inputs. Each mux straddles two adjacent horizontal
-# lanes. `select` names a config field, or one bit of one with `field[bit]`.
+# The three LUT inputs. Each mux straddles two adjacent horizontal lanes.
+# `select` names a config field, or one bit of one with `field[bit]`.
 [[clb.input_muxes]]
 name = "a"
 select = "input_mux_a_sel"
@@ -73,13 +73,14 @@ sources = ["h_in:1", "h_in:2"]
 
 # Input c is the adder's third operand: as well as the two horizontal lanes
 # it reaches the vertical bus and the carry chain, which makes the cell a
-# full adder (pick XOR3 for the sum bit; carry_out follows automatically).
+# full adder (set the LUT to XOR3 for the sum bit; carry_out follows
+# automatically).
 #
 # NOTE: v_in:0 is a combinational lane -- vertical lanes 0 and 2 carry `op`,
 # lanes 1 and 3 carry `reg`. Feeding lane 0 back into the logic means a
 # vertical ring configured as pass-through can close a combinational loop
-# through a CLB's own operation core. DRC reports such loops as errors and
-# the simulator refuses to settle rather than hanging.
+# through a CLB's own LUT. DRC reports such loops as errors and the simulator
+# refuses to settle rather than hanging.
 [[clb.input_muxes]]
 name = "c"
 select = "input_mux_c_sel"
@@ -94,29 +95,42 @@ sources = ["h_in:2", "h_in:3", "v_in:0", "carry_in"]
 chain = "column_up"
 edge = 0
 
-[clb.operation]
-# The fixed operation core: `select` picks one of the ops below. Each truth
-# table has 2^3 entries indexed by the input muxes in listed order, input "a"
-# as bit 0: entry i is the result for a = i.0, b = i.1, c = i.2.
-select = "operation_select"
-ops = [
-    { code = 0, name = "AND3",  table = [0,0,0,0,0,0,0,1] },
-    { code = 1, name = "OR3",   table = [0,1,1,1,1,1,1,1] },
-    { code = 2, name = "XOR3",  table = [0,1,1,0,1,0,0,1] },
-    { code = 3, name = "NAND3", table = [1,1,1,1,1,1,1,0] },
-    { code = 4, name = "NOR3",  table = [1,0,0,0,0,0,0,0] },
-    { code = 5, name = "XNOR3", table = [1,0,0,1,0,1,1,0] },
-    { code = 6, name = "AO21",  table = [0,0,0,1,1,1,1,1] },
-    { code = 7, name = "MUX2",  table = [0,0,1,1,0,1,0,1] },
+[clb.lut]
+# The 3-input lookup table. `field` holds the 2^3 truth-table bits; `index`
+# lists the input muxes most-significant first, so the LUT output is
+# lut[a*4 + b*2 + c] (the RTL's `lut[{input_a, input_b, input_c}]`).
+field = "lut"
+index = ["a", "b", "c"]
+# The carry output, always computed regardless of the LUT: the full-adder
+# carry of a + b + c, as a truth table in the same index order.
+carry_table = [0, 0, 0, 1, 0, 1, 1, 1]
+# Display names for well-known LUT values. Purely cosmetic: the tools label a
+# cell with the first preset matching its LUT and offer these in pick lists;
+# every other value is equally legal.
+presets = [
+    { name = "AND3", value = 0x80 },
+    { name = "OR3", value = 0xFE },
+    { name = "XOR3", value = 0x96 },
+    { name = "NAND3", value = 0x7F },
+    { name = "NOR3", value = 0x01 },
+    { name = "XNOR3", value = 0x69 },
+    { name = "AO21", value = 0xEA },
+    { name = "MUX2", value = 0xE4 },
+    { name = "MAJ3", value = 0xE8 },
+    { name = "BUF_A", value = 0xF0 },
+    { name = "BUF_B", value = 0xCC },
+    { name = "BUF_C", value = 0xAA },
+    { name = "INV_A", value = 0x0F },
+    { name = "INV_B", value = 0x33 },
+    { name = "INV_C", value = 0x55 },
+    { name = "ZERO", value = 0x00 },
+    { name = "ONE", value = 0xFF },
 ]
-# The carry output, always computed regardless of the selected op: the
-# full-adder carry of a + b + c. Same indexing as the op tables.
-carry_table = [0,0,0,1,0,1,1,1]
 
 [clb.ff]
-# The flip-flop's data input is hard-wired to the operation result, and
-# horizontal lane 3 is its write enable. Global reset is synchronous, wins
-# over the enable, and loads the value in `reset_value_field`.
+# The flip-flop's data input is hard-wired to the LUT result, and horizontal
+# lane 3 is its write enable. Global reset is synchronous, wins over the
+# enable, and loads the value in `reset_value_field`.
 data = "op"
 enable = "h_in:3"
 edge = "rising"
@@ -192,30 +206,81 @@ sources = ["v_ring:0", "v_ring:1", "v_ring:2", "v_ring:3"]
 couple_field = "couple_to_previous"
 
 [io]
-# Net names driven onto each row's horizontal lanes at the left edge: one
-# line per row (row 0 first), one entry per lane (lane 0 first). These are
-# reserved names. Row 3's constants mean its lane-3 FF enables enter as 1.
-# The IO controllers hold no config bits.
-inputs = [
-    ["input_0", "input_1", "input_2", "input_3"],
-    ["input_4", "input_5", "input_6", "input_7"],
-    ["input_8", "input_9", "ddio_in_0", "ddio_in_1"],
-    ["fixed_zero", "fixed_one", "fixed_zero", "fixed_one"],
+# The IO controller sits between the chip pads and the fabric edges and holds
+# its own configuration register (same field ordering rules as the CLB).
+fields = [
+    { name = "input_mux_sel0a", width = 4 },
+    { name = "input_mux_sel0b", width = 4 },
+    { name = "input_mux_sel1a", width = 4 },
+    { name = "input_mux_sel1b", width = 4 },
+    { name = "input_mux_sel2a", width = 4 },
+    { name = "input_mux_sel2b", width = 4 },
+    { name = "input_mux_sel3a", width = 4 },
+    { name = "input_mux_sel3b", width = 4 },
+    { name = "output_mux_sel0", width = 4 },
+    { name = "output_mux_sel1", width = 4 },
+    { name = "output_mux_sel2", width = 4 },
+    { name = "output_mux_sel3", width = 4 },
+    { name = "output_mux_sel_ddio0", width = 4 },
+    { name = "output_mux_sel_ddio1", width = 4 },
+    { name = "output_mux_sel_ddio_dir0", width = 4 },
+    { name = "output_mux_sel_ddio_dir1", width = 4 },
 ]
-# Chip outputs read from each row's horizontal lanes at the right edge.
-# "" marks an unused lane.
-outputs = [
-    ["output_0", "output_1", "output_2", "output_3"],
-    ["output_4", "output_5", "output_6", "output_7"],
-    ["output_8", "output_9", "ddio_out_0", "ddio_out_1"],
-    ["ddio_dir_0", "ddio_dir_1", "", ""],
-]
-# Dual-direction pads: when `dir` is 1 the pad drives `out` and `in` is
-# forced to 0.
+
+# Chip pads. These names are reserved. Input-side pads are what the IO
+# controller can read: the chip inputs and the fabric side of each DDIO pad.
+# Output-side pads are what it drives: the chip outputs and each DDIO pad's
+# output value and direction.
+inputs = ["input_0", "input_1", "input_2", "input_3", "input_4",
+          "input_5", "input_6", "input_7", "input_8", "input_9"]
+outputs = ["output_0", "output_1", "output_2", "output_3", "output_4",
+           "output_5", "output_6", "output_7", "output_8", "output_9"]
+# Dual-direction pads: when `dir` is 1 the pad drives `out`, and the fabric
+# side `in` reads that same output value back; when `dir` is 0, `in` is the
+# external pin.
 ddio = [
     { in = "ddio_in_0", out = "ddio_out_0", dir = "ddio_dir_0" },
     { in = "ddio_in_1", out = "ddio_out_1", dir = "ddio_dir_1" },
 ]
+
+# Sources of every left-edge input mux, in select-code order. A pad name reads
+# that pad; an output-side pad name reads back the value the IO controller is
+# driving onto it, which is an on-chip loop from the right edge to the left.
+input_mux_sources = [
+    "input_0", "input_1", "input_2", "input_3", "input_4",
+    "input_5", "input_6", "input_7", "input_8", "input_9",
+    "ddio_in_0", "ddio_in_1",
+    "output_0", "output_1", "output_2", "output_3",
+]
+# What enters each row's horizontal lanes at the left edge: one line per row
+# (row 0 first), one entry per lane (lane 0 first). "sel:<field>" is an input
+# mux over `input_mux_sources` selected by that field; a bare pad name is a
+# fixed connection.
+left = [
+    ["sel:input_mux_sel0a", "sel:input_mux_sel0b", "input_2", "input_3"],
+    ["sel:input_mux_sel1a", "sel:input_mux_sel1b", "input_6", "input_7"],
+    ["sel:input_mux_sel2a", "sel:input_mux_sel2b", "ddio_in_0", "ddio_in_1"],
+    ["sel:input_mux_sel3a", "sel:input_mux_sel3b", "input_8", "input_9"],
+]
+
+# What drives every output-side pad from the right edge. "lane:R:L" is a fixed
+# connection to row R lane L. "sel:<field>" is an output mux over every
+# right-edge lane, select code = row * buses.horizontal + lane.
+[io.drive]
+output_0 = "sel:output_mux_sel0"
+output_1 = "sel:output_mux_sel1"
+output_2 = "sel:output_mux_sel2"
+output_3 = "sel:output_mux_sel3"
+output_4 = "lane:1:2"
+output_5 = "lane:1:3"
+output_6 = "lane:2:2"
+output_7 = "lane:2:3"
+output_8 = "lane:3:2"
+output_9 = "lane:3:3"
+ddio_out_0 = "sel:output_mux_sel_ddio0"
+ddio_out_1 = "sel:output_mux_sel_ddio1"
+ddio_dir_0 = "sel:output_mux_sel_ddio_dir0"
+ddio_dir_1 = "sel:output_mux_sel_ddio_dir1"
 
 [bitstream]
 # The physical shift chain in data-flow order: shift_data_in enters the first
@@ -225,14 +290,21 @@ ddio = [
 # bit is emitted first and the first cell's bit 0 last. The exporter derives
 # that; this section only declares the chain.
 chain = [
-    { cells = "clb", order = "row_major" },        # (r0,c0) (r0,c1) ... (r3,c6)
-    { cells = "csb", order = "column_ascending" }, # CSB0 ... CSB6
+    { cells = "clb", order = "row_major" },        # (r0,c0) (r0,c1) ... (r3,c7)
+    { cells = "io", order = "single" },            # the IO controller
+    { cells = "csb", order = "column_ascending" }, # CSB0 ... CSB7
 ]
+# Programming starts with one extra bit ahead of the configuration: while
+# reset is held, the first 1 on shift_data_in freezes the fabric outputs for
+# the rest of programming. It is shifted out of the far end of the chain by
+# the time the configuration is in place, so it occupies no config bit.
+start_bit = 1
 
 [naming]
 # {col} and {row} are substituted with the block's grid position.
 clb = "CLB{col}_{row}"
 csb = "CSB{col}"
+io = "IO"
 suffix_op = "_op"
 suffix_reg = "_reg"
 suffix_carry = "_carry"

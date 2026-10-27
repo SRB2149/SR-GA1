@@ -10,9 +10,12 @@ Each tick executes in this exact order, and no other:
 
 1. **Apply stimulus.** Every chip input reads element `tick mod len` of its
    pattern list (a single-element list is a constant, `[0,1]` is a clock).
-   A missing pattern reads as constant 0. DDIO inputs are additionally gated:
-   while the corresponding `ddio_dir` output is 1, the input is forced to 0 —
-   this gate is part of the combinational network, not of stimulus application.
+   A missing pattern reads as constant 0. The IO controller is part of the
+   combinational network, not of stimulus application: each output-side pad
+   takes the right-edge lane its output mux selects; a DDIO input reads its
+   own output back while its `ddio_dir` is 1, and the pin otherwise; a
+   board-wired input reads the output wired to it; and each left-edge lane
+   takes whatever its input mux selects — a pad, or `output_0..3` read back.
 2. **Settle combinational logic to a fixed point**, using the register values
    held from the end of the previous tick.
 3. **Resolve every CSB's clock** from that settled state, following the
@@ -24,7 +27,7 @@ Each tick executes in this exact order, and no other:
 5. **Commit registers simultaneously** for every column whose clock rose,
    using the settled values from step 2: if reset is asserted the FF loads its
    configured `op_ff_reset_val`; otherwise, if its enable (horizontal lane 3
-   at that CLB) settled to 1, it captures the settled operation result.
+   at that CLB) settled to 1, it captures the settled LUT result.
 
 Nothing clock-dependent changes until the end of the tick. The settled state
 returned for a tick therefore shows the *pre-commit* register values; a
@@ -55,12 +58,14 @@ Two consequences of the fixed-point-from-zero policy:
   engine shows such rings as `<unconnected>`, and DRC warns about them.
 - **Oscillating loops are detected, never hung on.** If the cap is exceeded,
   simulation stops with a `CombinationalLoop` error naming the blocks whose
-  outputs were still changing. There are two ways to build one: the DDIO
-  direction feedback (`ddio_dir` gating `ddio_in`), and the vertical ring — input mux c can read `vert_bus_in[0]`, which carries
-  `operation_result`, so a ring configured as pass-through can feed a CLB's
-  own output back into its logic. Horizontal buses still flow strictly
-  left→right, and the carry chain runs strictly upward within a column
-  without wrapping, so neither of those can close a cycle on its own.
+  outputs were still changing. There are three ways to build one: the
+  vertical ring — input mux c can read `vert_bus_in[0]`, which carries the LUT
+  result, so a ring configured as pass-through can feed a CLB's own output back
+  into its logic; a chip output the IO controller reads back onto the left
+  edge (or board wiring doing the same); and a DDIO pad in output mode reading
+  its own output back. Horizontal buses still flow strictly left→right, and
+  the carry chain runs strictly upward within a column without wrapping, so
+  neither of those can close a cycle on its own.
 
   A cycle does not always oscillate — a non-inverting loop reaches a fixed
   point and settles — but it is never intentional, and event simulators can

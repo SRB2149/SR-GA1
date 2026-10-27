@@ -5,10 +5,11 @@
 //! because the net arriving there is named after whatever drives it. Neither
 //! touches stimulus keys, trace ids or the bitstream.
 //!
-//! A loop is a wire from a chip output back to a chip input. It costs no
-//! configuration, it is the only way a signal can return to the cell that
-//! produced it, and — being a wire — it breaks no combinational path, so a cycle
-//! closed through one oscillates exactly as one inside the fabric would.
+//! A board loop is a wire from a chip output back to a chip input. It costs no
+//! configuration and — being a wire — it breaks no combinational path, so a
+//! cycle closed through one oscillates exactly as one inside the fabric would.
+//! The IO controller can loop `output_0..3` back on-chip as well; that is
+//! tested with the simulator.
 
 use fpga_core::config::{BlockId, Design, IoPad};
 use fpga_core::designfile::{load_design, save_design, DesignFile};
@@ -20,6 +21,10 @@ use fpga_core::sim::{SimError, SimState, Stimulus};
 fn fabric() -> Fabric {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fabric.toml");
     Fabric::load_file(std::path::Path::new(path)).expect("fabric.toml must load")
+}
+
+fn pad(f: &Fabric, name: &str) -> IoPad {
+    IoPad::by_name(f, name).expect(name)
 }
 
 /// Pass row 0 lane 0 straight through the fabric to the right edge: every CLB in
@@ -38,7 +43,7 @@ fn passthrough_row0(fabric: &Fabric) -> Design {
 fn naming_an_input_pad_renames_its_net() {
     let f = fabric();
     let mut design = passthrough_row0(&f);
-    let pad = IoPad::input(0, 0);
+    let pad = pad(&f, "input_0");
 
     let before = {
         let nets = resolve(&f, &design);
@@ -66,14 +71,14 @@ fn naming_an_output_pad_does_not_rename_any_net() {
     let f = fabric();
     let mut design = passthrough_row0(&f);
     design
-        .rename_io(&f, IoPad::output(0, 0), "result")
+        .rename_io(&f, pad(&f, "output_0"), "result")
         .expect("output_0 may be named");
 
     let nets = resolve(&f, &design);
     // The net arriving at the right edge still comes from the input pad.
     assert_eq!(Namer::new(&f, &design).net_name(nets.horz_edge(0, 0)), "input_0");
     assert_eq!(
-        design.effective_io_name(&f, IoPad::output(0, 0)).as_deref(),
+        design.effective_io_name(&f, pad(&f, "output_0")).as_deref(),
         Some("result"),
         "the pad itself displays the design's name"
     );
@@ -90,11 +95,11 @@ fn a_block_and_a_pad_may_carry_the_same_name() {
 
     design.rename(&f, BlockId::Clb { col: 0, row: 0 }, "count[0]").expect("block");
     design
-        .rename_io(&f, IoPad::output(0, 0), "count[0]")
+        .rename_io(&f, pad(&f, "output_0"), "count[0]")
         .expect("the pad the cell's result leaves on may share its name");
 
     // And in the other order.
-    design.rename_io(&f, IoPad::output(0, 1), "q").expect("pad");
+    design.rename_io(&f, pad(&f, "output_1"), "q").expect("pad");
     design.rename(&f, BlockId::Clb { col: 1, row: 0 }, "q").expect("block");
 }
 
@@ -106,21 +111,21 @@ fn a_pad_name_must_not_collide_with_another_net() {
     let mut design = Design::new(&f);
 
     // Another pad's name.
-    design.rename_io(&f, IoPad::input(0, 0), "mine").expect("first pad");
-    let err = design.rename_io(&f, IoPad::input(0, 1), "mine").unwrap_err();
+    design.rename_io(&f, pad(&f, "input_0"), "mine").expect("first pad");
+    let err = design.rename_io(&f, pad(&f, "input_1"), "mine").unwrap_err();
     assert!(err.to_string().contains("already in use"), "{}", err);
 
     // A reserved pad name belonging to a different pad.
-    let err = design.rename_io(&f, IoPad::input(0, 1), "input_4").unwrap_err();
+    let err = design.rename_io(&f, pad(&f, "input_1"), "input_4").unwrap_err();
     assert!(err.to_string().contains("already in use"), "{}", err);
 
     // A net a block implies. CLB0_0's combinational output is CLB0_0_op.
     let derived = format!("CLB0_0{}", f.naming.suffix_op);
-    let err = design.rename_io(&f, IoPad::input(0, 1), &derived).unwrap_err();
+    let err = design.rename_io(&f, pad(&f, "input_1"), &derived).unwrap_err();
     assert!(err.to_string().contains("already in use"), "{}", err);
 
     // Renaming a pad to what it already displays is not a collision.
-    design.rename_io(&f, IoPad::input(0, 2), "input_2").expect("idempotent rename");
+    design.rename_io(&f, pad(&f, "input_2"), "input_2").expect("idempotent rename");
 }
 
 /// The mirror: a block cannot take a name whose derived net would collide with a
@@ -132,7 +137,7 @@ fn a_blocks_derived_nets_must_not_collide_with_a_pad() {
     // A pad named exactly what CLB0_0's output net would be called if the block
     // were renamed to "sum".
     let pad_name = format!("sum{}", f.naming.suffix_op);
-    design.rename_io(&f, IoPad::input(0, 0), &pad_name).expect("pad");
+    design.rename_io(&f, pad(&f, "input_0"), &pad_name).expect("pad");
 
     let err = design.rename(&f, BlockId::Clb { col: 0, row: 0 }, "sum").unwrap_err();
     assert!(
@@ -143,25 +148,11 @@ fn a_blocks_derived_nets_must_not_collide_with_a_pad() {
 }
 
 #[test]
-fn a_constant_pad_cannot_be_named_or_driven() {
-    let f = fabric();
-    let mut design = Design::new(&f);
-    // Row 3's lanes are tied to constants by the input controller.
-    let constant = (0..f.horz_lanes)
-        .map(|lane| IoPad::input(3, lane))
-        .find(|pad| pad.is_constant(&f))
-        .expect("row 3 supplies constants");
-
-    assert!(design.rename_io(&f, constant, "nope").is_err());
-    assert!(design.set_loopback(&f, IoPad::output(0, 0), constant).is_err());
-}
-
-#[test]
 fn a_loop_runs_from_an_output_to_an_input() {
     let f = fabric();
     let mut design = Design::new(&f);
-    let out = IoPad::output(0, 0);
-    let inp = IoPad::input(1, 0);
+    let out = pad(&f, "output_0");
+    let inp = pad(&f, "input_4");
 
     // The wrong way round is refused.
     assert!(design.set_loopback(&f, inp, out).is_err());
@@ -171,13 +162,13 @@ fn a_loop_runs_from_an_output_to_an_input() {
     assert_eq!(design.loopback_targets(out), vec![inp]);
 
     // One output may fan out to several inputs.
-    let second = IoPad::input(2, 0);
+    let second = pad(&f, "input_5");
     design.set_loopback(&f, out, second).expect("fan out");
     assert_eq!(design.loopback_targets(out).len(), 2);
 
     // An input has exactly one driver, so a second wire into it replaces the
     // first rather than adding to it.
-    let other = IoPad::output(0, 1);
+    let other = pad(&f, "output_1");
     design.set_loopback(&f, other, inp).expect("replace the driver");
     assert_eq!(design.loopback_driver(inp), Some(other));
     assert_eq!(design.loopback().len(), 2);
@@ -195,10 +186,11 @@ fn the_simulator_carries_a_value_round_a_loop() {
     for col in 0..f.columns {
         design.set_clb(&f, col, 1, "minor_horz_sel", 0b01).expect("pass through");
     }
-    // Wire row 0's output back into row 1's input.
+    // Wire row 0's output back to input_4, which row 1's lane 0 reads.
     design
-        .set_loopback(&f, IoPad::output(0, 0), IoPad::input(1, 0))
+        .set_loopback(&f, pad(&f, "output_0"), pad(&f, "input_4"))
         .expect("loop");
+    design.set_io(&f, "input_mux_sel1a", 4).unwrap();
 
     let mut stimulus = Stimulus::default();
     stimulus.set("input_0", vec![true]);
@@ -219,13 +211,17 @@ fn a_combinational_loop_through_board_wiring_is_detected_not_hung_on() {
     let mut design = Design::new(&f);
     // Every CLB in row 0 drives its own result onto lane 0 (the default), and
     // input a reads lane 0, so tying the row's output back to its input closes a
-    // path through four operation cores.
+    // path through every LUT in the row.
     design
-        .set_loopback(&f, IoPad::output(0, 0), IoPad::input(0, 0))
+        .set_loopback(&f, pad(&f, "output_0"), pad(&f, "input_0"))
         .expect("loop");
-    // NOR3 inverts, so the loop cannot settle.
+    // NOR3 inverts; an odd number of inversions round the loop cannot settle,
+    // so the last cell just buffers.
     for col in 0..f.columns {
-        design.set_clb(&f, col, 0, "operation_select", 4).expect("NOR3");
+        design.set_clb(&f, col, 0, "lut", f.preset_value("NOR3").unwrap()).expect("NOR3");
+    }
+    if f.columns.is_multiple_of(2) {
+        design.set_clb(&f, f.columns - 1, 0, "lut", f.preset_value("BUF_A").unwrap()).unwrap();
     }
 
     let stimulus = Stimulus::default();
@@ -242,8 +238,13 @@ fn drc_reports_a_loop_through_board_wiring() {
     let f = fabric();
     let mut design = Design::new(&f);
     design
-        .set_loopback(&f, IoPad::output(0, 0), IoPad::input(0, 0))
+        .set_loopback(&f, pad(&f, "output_0"), pad(&f, "input_0"))
         .expect("loop");
+    // The default all-zero LUT reads nothing, so give the row a function of
+    // its lane 0 input.
+    for col in 0..f.columns {
+        design.set_clb(&f, col, 0, "lut", f.preset_value("BUF_A").unwrap()).unwrap();
+    }
 
     let items = drc::check(&f, &design);
     let loops: Vec<&str> = items
@@ -265,14 +266,17 @@ fn logic_feeding_a_loop_is_not_reported_as_unused() {
     // CLB(0,1) is genuinely configured — an all-default cell is reported as
     // *unconfigured*, which is a different category from dead logic — and drives
     // its result onto lane 0, which the rest of row 1 passes along.
-    design.set_clb(&f, 0, 1, "operation_select", 1).expect("OR3");
+    design.set_clb(&f, 0, 1, "lut", f.preset_value("OR3").unwrap()).expect("OR3");
     for col in 1..f.columns {
         design.set_clb(&f, col, 1, "minor_horz_sel", 0b01).expect("pass through");
     }
-    // Row 1's output feeds row 2's input, and row 2 carries it onward: without
-    // the liveness edge, row 1's logic looks dead.
+    // Row 1's lane 0 leaves on output_0, which the board wires to input_5,
+    // which row 2's lane 0 reads and carries onward: without the liveness
+    // edge, row 1's logic looks dead.
+    design.set_io(&f, "output_mux_sel0", 4).unwrap();
+    design.set_io(&f, "input_mux_sel2a", 5).unwrap();
     design
-        .set_loopback(&f, IoPad::output(1, 0), IoPad::input(2, 0))
+        .set_loopback(&f, pad(&f, "output_0"), pad(&f, "input_5"))
         .expect("loop");
     for col in 0..f.columns {
         design.set_clb(&f, col, 2, "minor_horz_sel", 0b01).expect("pass through");
@@ -292,13 +296,13 @@ fn the_file_carries_names_and_wiring_and_stays_compatible() {
     let f = fabric();
     let mut file = DesignFile::new(&f, "loops");
     file.design
-        .rename_io(&f, IoPad::input(0, 0), "clk")
+        .rename_io(&f, pad(&f, "input_0"), "clk")
         .expect("name an input");
     file.design
-        .rename_io(&f, IoPad::output(0, 1), "q")
+        .rename_io(&f, pad(&f, "output_1"), "q")
         .expect("name an output");
     file.design
-        .set_loopback(&f, IoPad::output(0, 0), IoPad::input(1, 0))
+        .set_loopback(&f, pad(&f, "output_0"), pad(&f, "input_4"))
         .expect("loop");
 
     let text = save_design(&f, &file);
@@ -307,11 +311,11 @@ fn the_file_carries_names_and_wiring_and_stays_compatible() {
 
     let (back, warnings) = load_design(&f, &text).expect("round trip");
     assert!(warnings.is_empty(), "{:?}", warnings);
-    assert_eq!(back.design.io_name(IoPad::input(0, 0)), Some("clk"));
-    assert_eq!(back.design.io_name(IoPad::output(0, 1)), Some("q"));
+    assert_eq!(back.design.io_name(pad(&f, "input_0")), Some("clk"));
+    assert_eq!(back.design.io_name(pad(&f, "output_1")), Some("q"));
     assert_eq!(
-        back.design.loopback_driver(IoPad::input(1, 0)),
-        Some(IoPad::output(0, 0))
+        back.design.loopback_driver(pad(&f, "input_4")),
+        Some(pad(&f, "output_0"))
     );
 
     // A design with neither must be byte-identical to the format before these

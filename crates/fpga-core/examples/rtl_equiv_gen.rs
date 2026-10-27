@@ -1,10 +1,11 @@
 //! RTL equivalence harness generator.
 //!
 //! Emits self-checking SystemVerilog testbenches that program the SR_GA1 RTL
-//! with a bitstream exported by this tool, drive random stimulus, and compare
-//! the chip outputs against this simulator's results tick by tick. See
-//! `docs/rtl-equivalence.md` for how the comparison is made sound (X-masking,
-//! register cones, glitch-safe clocking) and how to run the testbenches.
+//! with a bitstream exported by this tool — start bit, freeze and all — drive
+//! random stimulus, and compare the chip outputs against this simulator's
+//! results tick by tick. See `docs/rtl-equivalence.md` for how the comparison
+//! is made sound (X-masking, register cones, glitch-safe clocking) and how to
+//! run the testbenches.
 //!
 //!   cargo run -p fpga-core --example rtl_equiv_gen -- \
 //!       [--fabric fabric.toml] [--out tb/equiv] [--comb 4] [--reg 2] \
@@ -13,7 +14,7 @@
 use fpga_core::bitstream;
 use fpga_core::config::Design;
 use fpga_core::drc;
-use fpga_core::fabric::{BusOut, Fabric, Source};
+use fpga_core::fabric::{BusOut, Fabric, IoSource, Source};
 use fpga_core::naming::{resolve, NetOrigin};
 use fpga_core::sim::{SimState, Stimulus};
 use std::collections::HashSet;
@@ -78,7 +79,6 @@ fn main() {
     // A ModelSim/Questa batch script covering every generated case.
     let hdl = [
         "hdl/regs/shift_reg_no_reset.sv",
-        "hdl/mux/mux.sv",
         "hdl/clb/clb.sv",
         "hdl/grid/clb_grid.sv",
         "hdl/io/io_controller.sv",
@@ -118,19 +118,33 @@ fn random_design(fabric: &Fabric, rng: &mut Rng) -> Design {
             d.csb_mut(col).set(i, f.width, v);
         }
     }
+    for (i, f) in fabric.io_fields.iter().enumerate() {
+        let v = rng.bits(f.width);
+        d.io_mut().set(i, f.width, v);
+    }
     d
 }
 
 /// The registered template from the simulator tests: column 0's clock is
 /// input_0, buffered through CLB(0,0)'s op and snaked up the vertical ring;
 /// rows 0-2 of column 0 hold randomized logic whose registers are observed on
-/// lane 3 of their rows at the right edge.
+/// lane 3 of their rows at the right edge (output_3, output_5, output_7).
 fn registered_design(fabric: &Fabric, rng: &mut Rng) -> Design {
     let mut d = Design::new(fabric);
     let set = |d: &mut Design, col: usize, row: usize, field: &str, v: u64| {
         d.set_clb(fabric, col, row, field, v).expect("template field");
     };
-    set(&mut d, 0, 0, "operation_select", 1); // OR3 of (input_0, 0-able, 0-able)
+    let buf_a = fabric.preset_value("BUF_A").expect("BUF_A preset");
+    set(&mut d, 0, 0, "lut", buf_a); // op = input_0 on row 0 lane 0
+    d.set_io(fabric, "output_mux_sel3", 3).expect("output_3 <- row 0 lane 3");
+    // Data rows read random pads, never input_0 (the clock) and never an
+    // output, so data changes only on the even ticks.
+    for row in 1..fabric.rows.min(3) {
+        for side in ["a", "b"] {
+            let pad = 1 + rng.next() % 9;
+            d.set_io(fabric, &format!("input_mux_sel{}{}", row, side), pad).expect("input mux");
+        }
+    }
     set(&mut d, 0, 1, "minor_vert_sel", 0b0100);
     set(&mut d, 0, 2, "minor_vert_sel", 0b0001);
     set(&mut d, 0, 3, "minor_vert_sel", 0b0100);
@@ -148,7 +162,7 @@ fn registered_design(fabric: &Fabric, rng: &mut Rng) -> Design {
         set(&mut d, 0, row, "input_mux_a_sel", rng.bits(1));
         set(&mut d, 0, row, "input_mux_b_sel", rng.bits(1));
         set(&mut d, 0, row, "input_mux_c_sel", rng.bits(2));
-        set(&mut d, 0, row, "operation_select", rng.bits(3));
+        set(&mut d, 0, row, "lut", rng.bits(8));
         set(&mut d, 0, row, "op_ff_reset_val", rng.bits(1));
     }
     set(&mut d, 0, 0, "op_ff_reset_val", rng.bits(1));
@@ -161,13 +175,11 @@ fn registered_design(fabric: &Fabric, rng: &mut Rng) -> Design {
 fn output_mask(fabric: &Fabric, design: &Design, allow_reg_col0: bool) -> u16 {
     let nets = resolve(fabric, design);
     let mut mask = 0u16;
-    for (row, lanes) in fabric.io_outputs.iter().enumerate() {
-        for (lane, name) in lanes.iter().enumerate() {
-            let Some(name) = name else { continue };
-            let Some(bit) = out_bit(name) else { continue };
-            if cone_is_comparable(fabric, design, &nets, row, lane, allow_reg_col0) {
-                mask |= 1 << bit;
-            }
+    for (o, name) in fabric.io_outputs.iter().enumerate() {
+        let Some(bit) = out_bit(name) else { continue };
+        let (row, lane) = design.pad_lane(fabric, o);
+        if cone_is_comparable(fabric, design, &nets, row, lane, allow_reg_col0) {
+            mask |= 1 << bit;
         }
     }
     mask
@@ -261,13 +273,20 @@ fn cone_is_comparable(
         };
         let ok = match seg {
             Seg::H(r, l, 0) => {
-                // Left edge; a gated DDIO input depends on its direction pin.
-                let name = &fabric.io_inputs[r][l];
-                if let Some(dd) = fabric.ddio.iter().find(|d| d.input == *name) {
-                    if let Some((dr, dl)) = fabric.io_outputs.iter().enumerate().find_map(|(rr, ls)| {
-                        ls.iter().position(|n| n.as_deref() == Some(dd.dir.as_str())).map(|ll| (rr, ll))
-                    }) {
+                // Left edge: an on-chip loop continues from the output it
+                // reads; a DDIO input depends on its direction and output.
+                match design.left_source(fabric, r, l) {
+                    IoSource::OutPad(o) => {
+                        let (dr, dl) = design.pad_lane(fabric, o);
                         stack.push(Seg::H(dr, dl, fabric.columns));
+                    }
+                    IoSource::InPad(i) => {
+                        if let Some(dd) = fabric.ddio_of_input(i) {
+                            for o in [dd.dir, dd.output] {
+                                let (dr, dl) = design.pad_lane(fabric, o);
+                                stack.push(Seg::H(dr, dl, fabric.columns));
+                            }
+                        }
                     }
                 }
                 true
@@ -295,15 +314,7 @@ fn cone_is_comparable(
 }
 
 fn stimulus_inputs(fabric: &Fabric) -> Vec<String> {
-    let mut names = Vec::new();
-    for row in &fabric.io_inputs {
-        for name in row {
-            if *name != fabric.naming.constant_zero && *name != fabric.naming.constant_one && !names.contains(name) {
-                names.push(name.clone());
-            }
-        }
-    }
-    names
+    fabric.io_inputs.clone()
 }
 
 fn stim_bit(name: &str) -> Option<usize> {
@@ -322,9 +333,10 @@ fn emit_case(fabric: &Fabric, out_dir: &std::path::Path, name: &str, rng: &mut R
         let design = if registered { registered_design(fabric, rng) } else { random_design(fabric, rng) };
         // Reject any structural combinational cycle. A non-inverting loop
         // settles here but can still spin forever in delta-cycle event
-        // simulation, so these configurations are not comparable. Since
-        // input mux c can read vertical lane 0 (a combinational lane), the
-        // vertical ring is a loop source as well as the DDIO gate.
+        // simulation, so these configurations are not comparable. Loops can
+        // close through the vertical ring (input mux c reads the
+        // combinational lane 0), the IO controller's on-chip loops and DDIO
+        // read-back.
         if !drc::combinational_loops(fabric, &design).is_empty() {
             continue 'attempt;
         }
@@ -362,12 +374,10 @@ fn emit_case(fabric: &Fabric, out_dir: &std::path::Path, name: &str, rng: &mut R
         };
         let outputs_of = |s: &fpga_core::sim::Settled| -> u16 {
             let mut v = 0u16;
-            for (row, lanes) in fabric.io_outputs.iter().enumerate() {
-                for (lane, name) in lanes.iter().enumerate() {
-                    if let Some(bit) = name.as_deref().and_then(out_bit) {
-                        if s.horz_edge(row, lane) {
-                            v |= 1 << bit;
-                        }
+            for (o, name) in fabric.io_outputs.iter().enumerate() {
+                if let Some(bit) = out_bit(name) {
+                    if s.pad_out(o) {
+                        v |= 1 << bit;
                     }
                 }
             }
@@ -392,27 +402,11 @@ fn emit_case(fabric: &Fabric, out_dir: &std::path::Path, name: &str, rng: &mut R
             continue 'attempt;
         }
 
-        // Quiescent ring values (all inputs 0, registers at reset): assigned
-        // procedurally after `release`, because a released variable keeps the
-        // forced value until its driver next changes — a ring segment that
-        // settles to a constant would otherwise stay stuck at the forced 0.
-        let quiet_rings: Vec<u8> = match SimState::new(fabric, &design, &Stimulus::default()) {
-            Ok((_, s)) => (0..fabric.columns)
-                .map(|col| {
-                    (0..fabric.vert_lanes).fold(0u8, |acc, lane| {
-                        acc | ((s.ring_tap(col, lane) as u8) << lane)
-                    })
-                })
-                .collect(),
-            Err(_) => vec![0; fabric.columns],
-        };
-
         let bits = bitstream::export_bits(fabric, &design);
         let tb = render_tb(name, &bits, &vectors, &expected, mask, registered);
         let path = out_dir.join(format!("{}_tb.sv", name));
         std::fs::write(&path, tb).expect("write testbench");
-        std::fs::write(out_dir.join(format!("{}.do", name)), render_do(name, bits.len(), &quiet_rings))
-            .expect("write do script");
+        std::fs::write(out_dir.join(format!("{}.do", name)), "run -all\nquit -f\n").expect("write do script");
         println!(
             "{}: attempt {}, mask {:014b}, {} ticks -> {}",
             name,
@@ -426,35 +420,6 @@ fn emit_case(fabric: &Fabric, out_dir: &std::path::Path, name: &str, rng: &mut R
     eprintln!("{}: gave up after 500 attempts", name);
 }
 
-/// The per-case simulator control script. Pure pass-through vertical rings
-/// are copy cycles: in zero-delay event simulation, unequal values rotate
-/// around them forever and hit the delta iteration limit — transiently
-/// during programming for almost any bitstream. Every ring closes through
-/// the top-level vertical_buses nets, so the script freezes those at 0 for
-/// exactly the programming phase (2 ns per bit), then releases them and
-/// deposits the quiescent settled values (all inputs 0, registers at reset).
-/// A deposit yields to the next real driver change, so nothing stays stale;
-/// this is done at the tool level because an SV-side force/release on these
-/// port-collapsed variables permanently detaches them from their drivers in
-/// ModelSim.
-fn render_do(name: &str, n_bits: usize, quiet_rings: &[u8]) -> String {
-    // The cut point is each row-0 CLB's vert_bus_in port: ModelSim refuses
-    // to force elements of the top-level unpacked vertical_buses array, but
-    // the packed per-instance port takes a force, and every ring cycle runs
-    // through it.
-    let port = |c: usize| format!("{{/{}_tb/dut/clb_grid_u/row[0]/col[{}]/clb_u/vert_bus_in}}", name, c);
-    let mut s = String::new();
-    for c in 0..quiet_rings.len() {
-        s.push_str(&format!("force -freeze {} 2#0000\n", port(c)));
-    }
-    s.push_str(&format!("run {}ns\n", 2 * n_bits));
-    for (c, v) in quiet_rings.iter().enumerate() {
-        s.push_str(&format!("noforce {}\n", port(c)));
-        s.push_str(&format!("force -deposit {} 2#{:04b}\n", port(c), v));
-    }
-    s.push_str("run -all\nquit -f\n");
-    s
-}
 
 #[allow(clippy::too_many_arguments)]
 fn render_tb(
@@ -494,14 +459,16 @@ fn render_tb(
         s.push_str(&format!("        expected[{}] = 14'b{:014b};\n", t, v));
     }
     s.push_str(&format!(
-        "\n        // Program the scan chain (first bit transmitted lands deepest).\n\
-         \x20       // The companion .do script freezes the ring nets during this\n\
-         \x20       // phase and deposits their settled values afterwards.\n\
+        "\n        // Program per hdl/top/sr-ga1.sv: reset held, then the stream with\n\
+         \x20       // its leading start bit, which freezes the fabric (outputs and\n\
+         \x20       // vertical rings gated to 0) until reset is released. The\n\
+         \x20       // first bit transmitted lands deepest.\n\
          \x20       for (int i = 0; i < {}; i++) begin\n\
          \x20           shift_data_in = BITS[i];\n\
          \x20           #1 shift_clk = 1; #1 shift_clk = 0;\n\
          \x20       end\n\
          \x20       shift_data_in = 0;\n\
+         \x20       #1 reset = 0; #1;\n\
          \x20       // Reset training: give every input-derived clock edges while\n\
          \x20       // reset is held, so reachable registers load their reset values.\n\
          \x20       reset = 1;\n\

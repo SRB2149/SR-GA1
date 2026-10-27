@@ -3,9 +3,9 @@
 //! Addition is the one thing on this fabric that is not ordinary logic. Every
 //! CLB computes the full-adder carry of its three selected inputs
 //! unconditionally and hands it to the cell directly above on a dedicated
-//! wire, so a ripple adder is one CLB per bit: pick the operation whose
-//! result is `a ^ b ^ c`, take `c` from `carry_in`, and the sum appears on
-//! `_op` while the carry climbs the column by itself.
+//! wire, so a ripple adder is one CLB per bit: set the LUT to `a ^ b ^ c`,
+//! take `c` from `carry_in`, and the sum appears on `_op` while the carry
+//! climbs the column by itself.
 //!
 //! Three hard limits come with it, and all three are reported rather than
 //! worked around:
@@ -15,19 +15,25 @@
 //! * **Row 0's carry input is tied off**, and the chain does not wrap. An
 //!   adder with a real carry-in must take it on a horizontal lane instead,
 //!   which the LSB cell can do because the same input mux reaches both.
-//! * **The top cell's carry-out goes nowhere.** Carry is on no output mux, so
-//!   a design that needs the final carry of a group cannot have it from the
-//!   chain; it has to be rebuilt in the operation core at real cost.
+//! * **The top cell's carry-out goes nowhere by itself.** Carry is on no
+//!   output mux, so a carry that is needed outside the chain — a carry-out
+//!   port, or the next segment of an adder wider than a column — is taken by
+//!   a *tap*: one more cell directly above, whose input `c` reads `carry_in`
+//!   and whose LUT copies it to `_op`. A wider adder is several segments, each
+//!   taking the previous tap's net as its carry-in on a lane.
 //!
-//! Nothing here is hard-coded: the operation and the mux codes are found by
-//! searching the fabric's own tables, so a fabric whose carry works
-//! differently is detected instead of mis-targeted.
+//! Nothing here is hard-coded: the LUT value and the mux codes are derived
+//! from the fabric's own tables, so a fabric whose carry works differently is
+//! detected instead of mis-targeted.
 
 use crate::fabric::{Fabric, Source};
 use std::fmt;
 
 /// The name the Yosys arithmetic map gives each adder bit.
 pub const CARRY_CELL: &str = "SRGA1_CARRY";
+
+/// The packed cell that taps a chain's carry onto an ordinary net.
+pub const CARRY_TAP: &str = "CARRY_TAP";
 
 #[derive(Debug, Clone)]
 pub struct CarryError {
@@ -45,9 +51,12 @@ impl std::error::Error for CarryError {}
 /// How to build one bit of a ripple adder on this fabric.
 #[derive(Debug, Clone)]
 pub struct CarryPlan {
-    /// Operation whose result is the three-input XOR.
-    pub op_code: u64,
-    pub op_name: String,
+    /// LUT value whose result is the three-input XOR.
+    pub lut: u64,
+    /// LUT value that copies the carry input, for a tap.
+    pub tap_lut: u64,
+    /// The library gate computing it, which carry cells are packed as.
+    pub gate: String,
     /// Physical input that can read the carry chain, and the select code.
     pub carry_input: usize,
     pub carry_code: u64,
@@ -69,14 +78,15 @@ impl CarryPlan {
         if inputs != 3 {
             return Err(CarryError {
                 message: format!(
-                    "the carry chain expects a three-input operation core; this fabric has {}",
+                    "the carry chain expects a three-input LUT; this fabric has {}",
                     inputs
                 ),
             });
         }
 
         // The carry output must be the full-adder carry, or a chain of these
-        // cells does not add.
+        // cells does not add. Majority is symmetric, so the table's index
+        // order does not matter here.
         let majority: Vec<bool> = (0..8)
             .map(|i| (i & 1) + (i >> 1 & 1) + (i >> 2 & 1) >= 2)
             .collect();
@@ -88,14 +98,17 @@ impl CarryPlan {
             });
         }
 
-        // The sum bit is the three-input XOR.
-        let xor3: Vec<bool> =
-            (0..8).map(|i| (i & 1) ^ (i >> 1 & 1) ^ (i >> 2 & 1) != 0).collect();
-        let op = fabric.operations.iter().find(|o| o.table == xor3).ok_or_else(|| CarryError {
-            message: "no operation computes the three-input XOR, so no cell can produce an \
-                      adder's sum bit"
-                .to_string(),
-        })?;
+        // The sum bit is the three-input XOR, which the LUT can always hold.
+        let lut = fabric.lut_value(|v| v[0] ^ v[1] ^ v[2]);
+        let library = crate::genlib::CellLibrary::derive(fabric);
+        let gate = library
+            .cells
+            .iter()
+            .find(|c| c.arity == 3 && c.impls.iter().any(|i| i.lut == lut))
+            .map(|c| c.name.clone())
+            .ok_or_else(|| CarryError {
+                message: "the cell library has no three-input XOR".to_string(),
+            })?;
 
         // Which input reads the chain.
         let (carry_input, carry_code) = fabric
@@ -114,9 +127,11 @@ impl CarryPlan {
 
         let addend_inputs: Vec<usize> = (0..inputs).filter(|&i| i != carry_input).collect();
 
+        let tap_lut = fabric.lut_value(|v| v[carry_input]);
         Ok(CarryPlan {
-            op_code: op.code,
-            op_name: op.name.clone(),
+            lut,
+            tap_lut,
+            gate,
             carry_input,
             carry_code,
             addend_inputs,
@@ -136,7 +151,7 @@ impl CarryPlan {
         format!(
             r#"// Generated by sr-ga1-synth. Maps Yosys' $alu onto the SR-GA1 carry chain.
 //
-// One {cell} per bit: S = A ^ B ^ CI on the operation core ({op}), and CO on
+// One {cell} per bit: S = A ^ B ^ CI in the LUT ({op}), and CO on
 // the dedicated chain to the cell above. The chain is at most {max} cells
 // long and its final carry-out is unreachable, both of which the packer
 // checks after mapping.
@@ -197,7 +212,7 @@ module \$alu (A, B, CI, BI, X, Y, CO);
 endmodule
 "#,
             cell = CARRY_CELL,
-            op = self.op_name,
+            op = self.gate,
             max = self.max_length
         )
     }

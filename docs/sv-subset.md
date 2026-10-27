@@ -38,10 +38,11 @@ rejected.
 | Construct | Hardware reason |
 |---|---|
 | Unpacked arrays (`logic x [0:3]`) | The fabric has no memory; every net is a single routed bit. |
-| Asynchronous reset | Reset is sampled on each column's clock. Config bit 19 holds the reset value and there is no asynchronous path. |
+| Asynchronous reset | Reset is sampled on each column's clock. The CLB's `op_ff_reset_val` bit holds the reset value and there is no asynchronous path. |
 | Inferred latches | The CLB has one edge-triggered flip-flop and no latch. Complete every branch, or give the signal a default. |
 | Tri-state, `inout`, `tri*`, `wand`, `wor`, `supply*` | Every lane segment has exactly one driving mux, so multi-driver conflicts are impossible by construction — and so is tri-state. DDIO pins are declared in the constraints file instead. |
-| `*`, `/`, `%` with non-constant operands | The only arithmetic primitive is the per-column carry chain, four cells long. A general multiplier does not fit. |
+| `*`, `/`, `%` with non-constant operands | The only arithmetic primitive is the per-column carry chain. A general multiplier does not fit. |
+| Undeclared identifiers (implicit nets) | Sources are read with `default_nettype none` in effect, so a typo is an error naming the identifier instead of an undriven wire that optimises the design away. An output left undriven after elaboration is an error too. |
 | `initial` | Describes simulation-time behaviour. The configuration shift registers (`Shift_Reg_No_Reset`) are not reset, so power-on state is undefined in silicon. |
 | Delays (`#5`) | Simulation-only; the fabric has no timing model. `#(...)` parameter overrides are fine. |
 | `task` | Not synthesisable in this subset; use a combinational `function`. |
@@ -57,9 +58,9 @@ rejected.
 Beyond the language subset, three things the RTL shape forces:
 
 1. **Exactly one reset net, synchronous, with constant reset values.** A
-   non-constant reset value has nowhere to live: config bit 19 holds a
-   constant. More than one reset net is an error — the chip has one global
-   reset pin.
+   non-constant reset value has nowhere to live: the CLB's `op_ff_reset_val`
+   bit holds a constant. More than one reset net is an error — the chip has one
+   global reset pin.
 2. **Reset must take priority over the enable**, matching the CLB's
    `if (reset) ... else if (horz_bus_in[3]) ...`. A register written the
    other way round (enable gating the reset) is normalised by Yosys where
@@ -77,11 +78,12 @@ Beyond the language subset, three things the RTL shape forces:
 The tool does not try to deduce bidirectional behaviour from SystemVerilog.
 A design uses a DDIO pin only by declaring it in the constraints file, naming
 the input net, the output net and the net driving `ddio_dir`. Those are then
-routed to `ddio_in_n`, `ddio_out_n` and row 3's `ddio_dir_n` output lane.
+routed to `ddio_in_n`, `ddio_out_n` and `ddio_dir_n`, whose output muxes can
+read any right-edge lane.
 
-An unconstrained DDIO pin is left at its default with its input path gated
-off. A design that references a DDIO net without a matching constraint gets
-a warning, not a silent connection.
+An unconstrained DDIO pin has its direction tied to 0, so it stays an input. A
+design that references a DDIO net without a matching constraint gets a warning,
+not a silent connection.
 
 ## How registers are mapped
 
@@ -97,7 +99,7 @@ power-on value (`x`) — which is honest, because the configuration shift
 registers have none.
 
 Every register is then fused into the cell that computes its data, because
-the flip-flop's data input is hard-wired to its own CLB's `operation_result`.
+the flip-flop's data input is hard-wired to its own CLB's LUT result.
 Since `_op` and `_reg` are separately routable, that fusion is free even when
 the driving cell has other consumers. A register whose data comes from a chip
 input, from another register, or from a cell that already carries one needs

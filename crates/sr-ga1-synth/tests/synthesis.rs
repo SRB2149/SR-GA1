@@ -91,7 +91,7 @@ fn check_wellformed(outcome: &Outcome, source: &str) {
 
     // The bitstream must survive a round trip exactly.
     let bits = bitstream::export_bits(&outcome.fabric, &outcome.config);
-    assert_eq!(bits.len(), outcome.fabric.total_bits());
+    assert_eq!(bits.len(), outcome.fabric.stream_bits());
     let decoded = bitstream::import_bits(&outcome.fabric, &bits)
         .unwrap_or_else(|e| panic!("{}: emitted bitstream did not decode: {}", source, e));
     assert_eq!(
@@ -202,12 +202,7 @@ fn automatic_pin_assignment_avoids_ddio_pads() {
         return;
     }
     let outcome = synthesise("dff1.sv", "dff1", "ddio", 0);
-    let reserved: Vec<&str> = outcome
-        .fabric
-        .ddio
-        .iter()
-        .flat_map(|d| [d.input.as_str(), d.output.as_str(), d.dir.as_str()])
-        .collect();
+    let reserved: Vec<&str> = outcome.fabric.ddio_pad_names();
     for pad in outcome
         .placement
         .input_pins
@@ -223,10 +218,11 @@ fn automatic_pin_assignment_avoids_ddio_pads() {
 }
 
 /// A shift register is the first design with register-to-register paths, so
-/// every register needs a cell that recomputes its data. It also shows the
-/// placer using the free-enable row, which is the main reason that row exists.
+/// every register needs a cell that recomputes its data. Its registers capture
+/// unconditionally, which needs a constant 1 on lane 3 from the CLB to the
+/// left — so none of them can sit in column 0, whose lane 3 is a chip input.
 #[test]
-fn a_shift_register_uses_the_free_enable_row() {
+fn unconditional_registers_avoid_column_zero() {
     if !have_yosys() {
         eprintln!("skipping: Yosys is not installed");
         return;
@@ -234,32 +230,15 @@ fn a_shift_register_uses_the_free_enable_row() {
     let outcome = synthesise("shift4.sv", "shift4", "shift4", 0);
     check_wellformed(&outcome, "shift4.sv");
     assert_eq!(outcome.packed.register_count(), 4);
-
-    // The row whose lane-3 segment enters as a constant 1 is where an
-    // unconditional register is free; the placer should prefer it.
-    let fabric = &outcome.fabric;
-    let lane = sr_ga1_synth::backend::enable_lane(fabric).expect("the flip-flop has an enable");
-    let free_row = (0..fabric.rows)
-        .find(|&row| fabric.io_constant(row, lane) == Some(true))
-        .expect("some row supplies a constant 1");
-    // The free row should be the placer's clear preference, but not an
-    // absolute rule: a register elsewhere only needs an upstream major mux to
-    // drive its enable, which costs a lane rather than a CLB, and that can be
-    // the better trade when staging columns are scarce. So require that row 3
-    // holds more registers than any other row rather than all of them.
-    let mut per_row = vec![0usize; fabric.rows];
     for (index, cell) in outcome.packed.cells.iter().enumerate() {
-        if cell.reg.is_some() {
-            per_row[outcome.placement.cells[index].row] += 1;
+        if cell.reg.as_ref().is_some_and(|r| r.enable == sr_ga1_synth::pack::Enable::Always) {
+            assert!(
+                outcome.placement.cells[index].col > 0,
+                "{} captures unconditionally but sits in column 0",
+                cell.name
+            );
         }
     }
-    let best = per_row.iter().copied().max().unwrap_or(0);
-    assert_eq!(
-        per_row[free_row], best,
-        "row {} has the free constant 1 on lane {}, so it should hold at least as many          registers as any other row; distribution was {:?}",
-        free_row, lane, per_row
-    );
-    assert!(per_row[free_row] >= 2, "the free-enable row should be used: {:?}", per_row);
 }
 
 /// The adder is the design the carry chain exists for: one CLB per bit, in a
@@ -295,89 +274,148 @@ fn an_adder_uses_one_carry_chain_up_one_column() {
     }
 }
 
-/// An addition wider than a column is refused, with the reason and the size
-/// limit, rather than being silently built as slow logic.
+/// An addition wider than a column is split into segments. Each segment that
+/// hands its carry on ends in a tap cell directly above its top bit, which
+/// turns the carry into a net the next segment reads as its carry-in.
 #[test]
-fn an_addition_wider_than_a_column_is_refused() {
+fn an_addition_wider_than_a_column_is_split_into_tapped_segments() {
     if !have_yosys() {
         eprintln!("skipping: Yosys is not installed");
         return;
     }
-    let mut progress = Progress::new(true);
-    let text = match flow::run(&options("add6.sv", "add6", "add6", 0), &mut progress) {
-        Err(e) => format!("{}", e),
-        Ok(_) => panic!("a 6-bit addition cannot fit a 4-cell chain"),
-    };
-    assert!(
-        text.contains("carry chain") && text.contains("4"),
-        "the message should name the chain and its length: {}",
-        text
-    );
+    let outcome = synthesise("add5.sv", "add5", "add5", 0);
+    check_wellformed(&outcome, "add5.sv");
+    let plan = outcome.carry.as_ref().expect("the fabric has a usable carry chain");
+    let is_tap = |cell: usize| outcome.packed.cells[cell].carry.as_ref().is_some_and(|l| l.tap);
+    let bits: usize = outcome.packed.chains.iter().flatten().filter(|&&c| !is_tap(c)).count();
+    assert_eq!(bits, 5, "one cell per bit");
+    assert!(outcome.packed.chains.len() >= 2, "five bits cannot share one four-row column");
+    for chain in &outcome.packed.chains {
+        assert!(chain.len() <= plan.max_length, "a segment plus its tap fits one column");
+        // Only the top of a segment can be a tap.
+        for &cell in &chain[..chain.len() - 1] {
+            assert!(!is_tap(cell), "a tap sits above its segment's top bit");
+        }
+        // Consecutive rows of one column; only a segment fed by the tied-off
+        // edge has to start at the edge row.
+        let (column, base) = (outcome.placement.cells[chain[0]].col, outcome.placement.cells[chain[0]].row);
+        let routed_in = outcome.packed.cells[chain[0]].carry.as_ref().is_some_and(|l| l.carry_in.is_some());
+        if !routed_in {
+            assert_eq!(base, plan.lsb_row);
+        }
+        for (index, &cell) in chain.iter().enumerate() {
+            assert_eq!(outcome.placement.cells[cell].col, column);
+            assert_eq!(outcome.placement.cells[cell].row, base + index);
+        }
+    }
+    // The final carry is the sum's top bit, so the last segment is tapped too.
+    assert!(is_tap(*outcome.packed.chains.last().unwrap().last().unwrap()));
 }
 
-/// The fabric cannot route a registered value back to the cell that produced
-/// it, so a register that depends on its own value is refused up front rather
-/// than after the whole search budget is spent.
+/// A carry-in port and a carry-out port: the carry-in arrives on a lane at the
+/// least significant bit, and the carry-out comes from a tap.
 #[test]
-fn a_self_dependent_register_is_refused_with_the_reason() {
+fn an_adder_with_carry_in_and_carry_out_fits() {
     if !have_yosys() {
         eprintln!("skipping: Yosys is not installed");
         return;
     }
+    let outcome = synthesise("add4c.sv", "add4c", "add4c", 0);
+    check_wellformed(&outcome, "add4c.sv");
+    let first = outcome.packed.chains[0][0];
+    let link = outcome.packed.cells[first].carry.as_ref().expect("a chain cell");
+    assert!(link.carry_in.is_some(), "cin is routed into the least significant bit");
+    assert!(outcome.packed.outputs.iter().any(|p| p.name == "cout"), "cout is an output");
+}
+
+/// An undeclared identifier is an error, not an implicit wire nothing drives —
+/// which would otherwise optimise the whole design away without a word.
+#[test]
+fn an_undeclared_identifier_is_an_error() {
+    if !have_yosys() {
+        eprintln!("skipping: Yosys is not installed");
+        return;
+    }
+    let dir = repo_root().join("target").join("synth-tests").join("undeclared");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let source = dir.join("typo.sv");
+    std::fs::write(
+        &source,
+        "module typo (input logic [3:0] a, input logic c_in, output logic [3:0] y);
+    assign y = a + cin;
+endmodule
+",
+    )
+    .expect("write source");
+    let mut opts = options("add4.sv", "typo", "undeclared", 0);
+    opts.sources = vec![source];
     let mut progress = Progress::new(true);
-    let text = match flow::run(&options("toggle.sv", "toggle", "toggle", 0), &mut progress) {
+    let text = match flow::run(&opts, &mut progress) {
         Err(e) => format!("{}", e),
-        Ok(_) => panic!("a toggle flip-flop needs feedback this fabric cannot route"),
+        Ok(_) => panic!("`cin` is not declared"),
     };
-    assert!(
-        text.contains("depend on its own value"),
-        "the message should explain the fabric limitation: {}",
-        text
-    );
-    assert!(text.contains("q"), "and name the signal involved: {}", text);
+    assert!(text.contains("cin"), "the error should name the identifier: {}", text);
+}
+
+/// A register that depends on its own value needs its output back at its own
+/// cell. The vertical ring cannot do it, but the IO controller can: the value
+/// leaves on one of the chip outputs it reads back, and re-enters on the left
+/// edge — no board wiring at all.
+#[test]
+fn a_self_dependent_register_loops_back_on_chip() {
+    if !have_yosys() {
+        eprintln!("skipping: Yosys is not installed");
+        return;
+    }
+    let outcome = synthesise("toggle.sv", "toggle", "toggle", 0);
+    check_wellformed(&outcome, "toggle.sv");
+    assert_eq!(outcome.packed.register_count(), 1);
+    assert!(sr_ga1_synth::report::loopback_wiring(&outcome).is_empty(), "no board wiring");
+    let loops = sr_ga1_synth::report::on_chip_loops(&outcome);
+    assert!(!loops.is_empty(), "the feedback returns through the IO controller");
+    let readable: Vec<String> = outcome
+        .fabric
+        .loopable_outputs()
+        .iter()
+        .map(|&o| outcome.fabric.io_outputs[o].clone())
+        .collect();
+    for (pad, ..) in &loops {
+        assert!(readable.contains(pad), "{} cannot be read back", pad);
+    }
 }
 
 /// The capability that decides the case above, read straight off the fabric.
 #[test]
 fn register_feedback_is_a_fabric_capability() {
     let f = fabric_of("add4.sv");
-    assert!(
-        !f.register_feedback_possible(),
-        "on this fabric no operation input reads a vertical lane carrying _reg"
-    );
-    // The two lane pairs never mix, which is what makes the answer no.
+    // Inside the fabric the two vertical lane pairs never mix, so a register
+    // cannot reach its own cell through the ring...
     let op = f.vert_lanes_for(sr_ga1_synth::fabric::Source::Op);
     let reg = f.vert_lanes_for(sr_ga1_synth::fabric::Source::Reg);
     assert!(op.iter().all(|l| !reg.contains(l)), "_op and _reg lanes are disjoint");
+    // ...but the IO controller reads output_0..3 back onto the left edge.
+    assert_eq!(f.loopable_outputs().len(), 4);
+    assert!(f.register_feedback_possible());
 }
 
-/// The point of loop-around wiring: a register that depends on its own value is
-/// impossible inside the fabric, and becomes possible once the board offers a
-/// path from a chip output back to a chip input.
+/// Board wiring still works as an extra resource, and anything it uses comes
+/// from the pool the constraints offered.
 #[test]
-fn loop_around_wiring_makes_self_dependent_state_buildable() {
+fn loop_around_wiring_is_an_extra_resource() {
     if !have_yosys() {
         eprintln!("skipping: Yosys is not installed");
         return;
     }
-    // Refused without a pool - see the test above for the diagnostic.
     let mut progress = Progress::new(true);
-    assert!(
-        flow::run(&options("toggle.sv", "toggle", "toggle-none", 0), &mut progress).is_err(),
-        "without board wiring a toggle flip-flop cannot be built"
-    );
-
-    // Buildable with one.
     let outcome = flow::run(
         &options_with_loopback("toggle.sv", "toggle", "toggle-loop", 0),
         &mut progress,
     )
-    .expect("a toggle flip-flop should fit once the board provides a loop");
+    .expect("a toggle flip-flop should fit with a pool declared");
     check_wellformed(&outcome, "toggle.sv");
     assert_eq!(outcome.packed.register_count(), 1);
 
     let wiring = sr_ga1_synth::report::loopback_wiring(&outcome);
-    assert!(!wiring.is_empty(), "the feedback has to go through a board wire");
     // Every link must name pads that were actually offered in the pool.
     let pool = &outcome.constraints.loopback;
     for link in &wiring {
@@ -395,9 +433,31 @@ fn loop_around_wiring_makes_self_dependent_state_buildable() {
 }
 
 /// The counter is the design that motivated all of this: four carry-chain bits,
-/// each feeding its own next value back through the board.
+/// each feeding its own next value back — through the IO controller, with no
+/// board wiring.
 #[test]
-fn a_counter_fits_once_the_board_provides_loops() {
+fn a_counter_fits_on_chip() {
+    if !have_yosys() {
+        eprintln!("skipping: Yosys is not installed");
+        return;
+    }
+    let outcome = synthesise("count4.sv", "count4", "count4", 0);
+    check_wellformed(&outcome, "count4.sv");
+
+    assert_eq!(outcome.packed.register_count(), 4);
+    assert_eq!(outcome.packed.chains.len(), 1, "the increment uses the carry chain");
+    assert_eq!(outcome.packed.chains[0].len(), 4);
+    assert!(sr_ga1_synth::report::loopback_wiring(&outcome).is_empty(), "no board wiring");
+    // One loop per bit, since each count bit feeds its own adder cell.
+    let loops = sr_ga1_synth::report::on_chip_loops(&outcome);
+    let nets: std::collections::BTreeSet<&str> = loops.iter().map(|(.., net)| net.as_str()).collect();
+    assert_eq!(nets.len(), 4, "each count bit needs its own way back: {:?}", loops);
+}
+
+/// With a pool declared as well, the counter still fits and board wiring never
+/// collides with a design input.
+#[test]
+fn a_counter_fits_with_a_pool_declared() {
     if !have_yosys() {
         eprintln!("skipping: Yosys is not installed");
         return;
@@ -405,16 +465,10 @@ fn a_counter_fits_once_the_board_provides_loops() {
     let mut progress = Progress::new(true);
     let outcome =
         flow::run(&options_with_loopback("count4.sv", "count4", "count4-loop", 0), &mut progress)
-            .expect("a 4-bit counter should fit with loop-around wiring");
+            .expect("a 4-bit counter should fit with loop-around wiring available");
     check_wellformed(&outcome, "count4.sv");
-
     assert_eq!(outcome.packed.register_count(), 4);
-    assert_eq!(outcome.packed.chains.len(), 1, "the increment uses the carry chain");
-    assert_eq!(outcome.packed.chains[0].len(), 4);
-
-    // One loop per bit, since each count bit feeds its own adder cell.
     let wiring = sr_ga1_synth::report::loopback_wiring(&outcome);
-    assert_eq!(wiring.len(), 4, "each count bit needs its own way back: {:?}", wiring);
 
     // An input pad carrying a board wire must never also be a design input.
     for link in &wiring {
@@ -444,6 +498,10 @@ fn the_chosen_wiring_is_reproducible() {
         sr_ga1_synth::report::loopback_wiring(&first),
         sr_ga1_synth::report::loopback_wiring(&second),
         "the same seed must ask for the same physical connections"
+    );
+    assert_eq!(
+        sr_ga1_synth::report::on_chip_loops(&first),
+        sr_ga1_synth::report::on_chip_loops(&second)
     );
     assert_eq!(
         bitstream::format_text(&first.fabric, &first.config, "toggle", "fixed", true),
@@ -618,8 +676,9 @@ fn emitted_names_are_unique_and_collision_free() {
     // The fabric's own reserved names are already in use.
     taken.push(fabric.naming.constant_zero.clone());
     taken.push(fabric.naming.constant_one.clone());
-    taken.extend(fabric.io_inputs.iter().flatten().cloned());
-    taken.extend(fabric.io_outputs.iter().flatten().flatten().cloned());
+    taken.push(fabric.naming.io.clone());
+    taken.extend(fabric.io_inputs.iter().cloned());
+    taken.extend(fabric.io_outputs.iter().cloned());
 
     for (block, name) in outcome.config.names() {
         assert!(

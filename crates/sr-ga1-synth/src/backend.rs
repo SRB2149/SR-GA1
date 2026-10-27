@@ -12,7 +12,7 @@ use crate::fabric::{Fabric, Source};
 use crate::pack::{Enable, PackedDesign, Signal};
 use crate::place::{Operand, Placement, Target};
 use crate::route::{Net, NetKind, Problem, Routing, Sink};
-use crate::rrg::{Node, Rrg};
+use crate::rrg::{ConfigCell, Node, Rrg};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -74,8 +74,8 @@ pub fn build_wiring(
         }
     }
     for (net, pad) in &placement.input_pins {
-        if let Some((row, lane)) = target.input_pad(pad) {
-            driver_node.insert(*net, Node::HSeg { row, col: 0, lane });
+        if let Some(index) = fabric.input_pad(pad) {
+            driver_node.insert(*net, Node::InPad(index));
         }
     }
 
@@ -111,19 +111,11 @@ pub fn build_wiring(
     }
 
     // ---- constants --------------------------------------------------------
-    // One net per value, rooted at the constant source and at every segment
-    // the IO map already supplies it on. That is what makes row 3's lane-3
-    // enables free, and what lets `b` and `c` share one lane.
+    // One net per value, rooted at the constant source the major muxes
+    // select, so several sinks share a lane wherever the hardware allows.
     let mut const_nets = [None, None];
     for value in [false, true] {
-        let mut roots = vec![id(Node::Const(value))];
-        for row in 0..fabric.rows {
-            for lane in 0..fabric.horz_lanes {
-                if fabric.io_constant(row, lane) == Some(value) {
-                    roots.push(id(Node::HSeg { row, col: 0, lane }));
-                }
-            }
-        }
+        let roots = vec![id(Node::Const(value))];
         const_nets[usize::from(value)] = Some(nets.len());
         nets.push(Net {
             name: if value {
@@ -220,12 +212,35 @@ pub fn build_wiring(
 
     // ---- design outputs ---------------------------------------------------
     for (net, pad) in &placement.output_pins {
-        let Some((row, lane)) = target.output_pad(pad) else { continue };
-        let Some(&net_id) = signal_nets.get(net) else { continue };
+        let Some(index) = fabric.output_pad(pad) else { continue };
+        // A constant output is one more sink on the constant net.
+        let net_id = match design.const_outputs.get(net) {
+            Some(&v) => const_nets[usize::from(v)],
+            None => signal_nets.get(net).copied(),
+        };
+        let Some(net_id) = net_id else { continue };
         nets[net_id].sinks.push(Sink {
             what: format!("chip output {}", pad),
-            options: vec![id(Node::HSeg { row, col: fabric.columns, lane })],
+            options: vec![id(Node::OutPad(index))],
         });
+    }
+
+    // ---- DDIO directions --------------------------------------------------
+    // A DDIO pad the design does not use must stay an input, so its direction
+    // is held at 0. Left alone, its mux would follow whatever row 0 lane 0
+    // carries and turn the pad into an output whenever that is 1.
+    let used_pads: Vec<&str> = placement.output_pins.values().map(|p| p.as_str()).collect();
+    for d in &fabric.ddio {
+        let dir_name = fabric.io_outputs[d.dir].as_str();
+        if used_pads.contains(&dir_name) || target.constraints.ddio_pads().contains(&dir_name) {
+            continue;
+        }
+        if let Some(net_id) = const_nets[0] {
+            nets[net_id].sinks.push(Sink {
+                what: format!("{} held at 0 so the pad stays an input", dir_name),
+                options: vec![id(Node::OutPad(d.dir))],
+            });
+        }
     }
 
     Wiring {
@@ -255,13 +270,10 @@ pub fn emit(
     // cells legitimately want the same name — three buffers can all be carrying
     // `count[3]` — so they are allocated rather than assigned.
     let mut names = crate::naming::NameAllocator::new();
-    for reserved in [&fabric.naming.constant_zero, &fabric.naming.constant_one] {
+    for reserved in [&fabric.naming.constant_zero, &fabric.naming.constant_one, &fabric.naming.io] {
         names.reserve(reserved);
     }
-    for pad in fabric.io_inputs.iter().flatten() {
-        names.reserve(pad);
-    }
-    for pad in fabric.io_outputs.iter().flatten().flatten() {
+    for pad in fabric.io_inputs.iter().chain(&fabric.io_outputs) {
         names.reserve(pad);
     }
     let allocate = |allocator: &mut crate::naming::NameAllocator, preferred: &str| -> String {
@@ -278,13 +290,13 @@ pub fn emit(
         name
     };
 
-    // ---- placed cells: operation and reset value --------------------------
+    // ---- placed cells: LUT and reset value --------------------------------
     for (index, cell) in design.cells.iter().enumerate() {
         let placed = &placement.cells[index];
 
-        // An adder bit's operation and carry select come from the carry plan,
-        // not from a library implementation: its third input is the chain.
-        let op_code = match (&cell.carry, target.carry) {
+        // An adder bit's LUT and carry select come from the carry plan, not
+        // from a library implementation: its third input is the chain.
+        let lut = match (&cell.carry, target.carry) {
             (Some(link), Some(plan)) => {
                 // Only the least significant cell may take its carry from a
                 // lane, and only when the tied-off edge value is wrong.
@@ -300,7 +312,11 @@ pub fn emit(
                             ),
                         })?;
                 }
-                plan.op_code
+                if link.tap {
+                    plan.tap_lut
+                } else {
+                    plan.lut
+                }
             }
             _ => {
                 let Some(gate) = library.cell(&cell.gate) else {
@@ -311,15 +327,15 @@ pub fn emit(
                         ),
                     });
                 };
-                gate.impls[placed.imp.min(gate.impls.len() - 1)].op_code
+                gate.impls[placed.imp.min(gate.impls.len() - 1)].lut
             }
         };
         config
-            .apply_slice(fabric, placed.col, placed.row, fabric.op_select, op_code)
+            .apply_slice(fabric, placed.col, placed.row, fabric.lut.select, lut)
             .map_err(|had| BackendError {
                 message: format!(
-                    "CLB({}, {}) is asked to be both operation {} and {}",
-                    placed.col, placed.row, had, op_code
+                    "CLB({}, {}) is asked to hold both LUT 0x{:02X} and 0x{:02X}",
+                    placed.col, placed.row, had, lut
                 ),
             })?;
         if let Some(reg) = &cell.reg {
@@ -335,11 +351,11 @@ pub fn emit(
     // ---- buffers the router allocated -------------------------------------
     for buffer in &routing.buffers {
         config
-            .apply_slice(fabric, buffer.col, buffer.row, fabric.op_select, buffer.op_code)
+            .apply_slice(fabric, buffer.col, buffer.row, fabric.lut.select, buffer.lut)
             .map_err(|had| BackendError {
                 message: format!(
-                    "CLB({}, {}) is used as a buffer needing operation {} but already holds {}",
-                    buffer.col, buffer.row, buffer.op_code, had
+                    "CLB({}, {}) is used as a buffer needing LUT 0x{:02X} but already holds 0x{:02X}",
+                    buffer.col, buffer.row, buffer.lut, had
                 ),
             })?;
         let preferred = format!("buf_{}", wiring.problem.nets[buffer.net].name);
@@ -351,19 +367,22 @@ pub fn emit(
     for (net_id, route) in routing.routes.iter().enumerate() {
         for (_, edge) in &route.edges {
             let Some(assign) = edge.assign else { continue };
-            config
-                .apply_slice(fabric, assign.col, assign.row, assign.slice, assign.value)
-                .map_err(|had| BackendError {
-                    message: format!(
-                        "net \"{}\" needs CLB({}, {}) mux code {} but {} is already using code {}",
-                        wiring.problem.nets[net_id].name,
-                        assign.col,
-                        assign.row,
-                        assign.value,
-                        "another net",
-                        had
-                    ),
-                })?;
+            let (applied, place) = match assign.cell {
+                ConfigCell::Clb { col, row } => (
+                    config.apply_slice(fabric, col, row, assign.slice, assign.value),
+                    format!("CLB({}, {})", col, row),
+                ),
+                ConfigCell::Io => (
+                    config.apply_io_slice(fabric, assign.slice, assign.value),
+                    format!("the IO controller's {}", fabric.io_fields[assign.slice.field].name),
+                ),
+            };
+            applied.map_err(|had| BackendError {
+                message: format!(
+                    "net \"{}\" needs {} mux code {} but another net is already using code {}",
+                    wiring.problem.nets[net_id].name, place, assign.value, had
+                ),
+            })?;
         }
     }
 

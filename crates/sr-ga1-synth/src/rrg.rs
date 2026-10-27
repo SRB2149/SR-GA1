@@ -21,13 +21,18 @@
 //!   past" against "hold this register enabled" automatically, instead of
 //!   one silently breaking the other.
 //! * **A vertical hop costs a CLB.** The only horizontal-to-vertical path is
-//!   through a CLB's operation core, so the graph carries an explicit
-//!   `In -> Op` edge at every CLB, priced accordingly. The router allocates
-//!   its own buffers; without that, most designs on this fabric are simply
-//!   unroutable.
+//!   through a CLB's LUT, so the graph carries an explicit `In -> Op` edge at
+//!   every CLB, priced accordingly. The router allocates its own buffers;
+//!   without that, most designs on this fabric are simply unroutable.
+//! * **Pads are nodes, and the IO controller is routing.** A chip input
+//!   reaches a left-edge lane through an input mux (or a fixed connection),
+//!   a right-edge lane reaches a chip output through an output mux, and an
+//!   output the controller can read back closes an on-chip loop to the left
+//!   edge. Each of those edges carries its IO configuration write, so the
+//!   router chooses pins' lanes the same way it chooses everything else.
 
 use crate::constraints::LoopbackPool;
-use crate::fabric::{BusOut, Fabric, FieldSlice, Source};
+use crate::fabric::{BusOut, Fabric, FieldSlice, IoSource, Source};
 use std::collections::HashMap;
 
 /// A place a signal can be.
@@ -45,18 +50,37 @@ pub enum Node {
     Reg { col: usize, row: usize },
     /// A CLB's carry output, which reaches nothing but the cell above.
     Carry { col: usize, row: usize },
-    /// A CLB's operation input, by input mux index.
+    /// A CLB's LUT input, by input mux index.
     In { col: usize, row: usize, mux: usize },
     Const(bool),
+    /// An input-side pad (index into `Fabric::io_inputs`).
+    InPad(usize),
+    /// An output-side pad (index into `Fabric::io_outputs`).
+    OutPad(usize),
+}
+
+/// Which block's configuration an edge writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigCell {
+    Clb { col: usize, row: usize },
+    Io,
 }
 
 /// A configuration write an edge implies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Assign {
-    pub col: usize,
-    pub row: usize,
+    pub cell: ConfigCell,
     pub slice: FieldSlice,
     pub value: u64,
+}
+
+impl Assign {
+    fn clb(col: usize, row: usize, slice: FieldSlice, value: u64) -> Assign {
+        Assign { cell: ConfigCell::Clb { col, row }, slice, value }
+    }
+    fn io(slice: FieldSlice, value: u64) -> Assign {
+        Assign { cell: ConfigCell::Io, slice, value }
+    }
 }
 
 /// What taking an edge costs beyond the wire itself.
@@ -66,7 +90,7 @@ pub enum EdgeKind {
     Wire,
     /// A CLB driving its own output onto a lane.
     Drive,
-    /// Passing through a CLB's operation core: the only horizontal-to-
+    /// Passing through a CLB's LUT: the only horizontal-to-
     /// vertical path there is, and it spends a CLB.
     Through,
     /// The dedicated carry chain.
@@ -77,6 +101,10 @@ pub enum EdgeKind {
     /// configuration bits, spends no CLB, and — being a wire — breaks no
     /// combinational path, so a cycle through one is still a cycle.
     Loopback,
+    /// The IO controller reading a chip output back onto a left-edge lane.
+    /// A wire too, but a configured one: it costs an output pad and an input
+    /// mux, and no board wiring.
+    OnChipLoop,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -157,6 +185,12 @@ impl Rrg {
         }
         add(Node::Const(false), &mut nodes, &mut index);
         add(Node::Const(true), &mut nodes, &mut index);
+        for pad in 0..fabric.io_inputs.len() {
+            add(Node::InPad(pad), &mut nodes, &mut index);
+        }
+        for pad in 0..fabric.io_outputs.len() {
+            add(Node::OutPad(pad), &mut nodes, &mut index);
+        }
 
         let mut out: Vec<Vec<Edge>> = vec![Vec::new(); nodes.len()];
         let mut link = |from: Node, to: Node, kind: EdgeKind, assign: Option<Assign>| {
@@ -179,12 +213,7 @@ impl Rrg {
                         }
                     };
                     for (code, source) in mux.sources.iter().enumerate() {
-                        let assign = Some(Assign {
-                            col,
-                            row,
-                            slice: mux.select,
-                            value: code as u64,
-                        });
+                        let assign = Some(Assign::clb(col, row, mux.select, code as u64));
                         let (from, kind) = match *source {
                             Source::HorzIn(lane) => {
                                 (Node::HSeg { row, col, lane }, EdgeKind::Wire)
@@ -207,12 +236,7 @@ impl Rrg {
                 for (mux_index, mux) in fabric.input_muxes.iter().enumerate() {
                     let target = Node::In { col, row, mux: mux_index };
                     for (code, source) in mux.sources.iter().enumerate() {
-                        let assign = Some(Assign {
-                            col,
-                            row,
-                            slice: mux.select,
-                            value: code as u64,
-                        });
+                        let assign = Some(Assign::clb(col, row, mux.select, code as u64));
                         let (from, kind) = match *source {
                             Source::HorzIn(lane) => {
                                 (Node::HSeg { row, col, lane }, EdgeKind::Wire)
@@ -233,7 +257,7 @@ impl Rrg {
                     }
                 }
 
-                // The operation core and the carry adder: combinational, and
+                // The LUT and the carry adder: combinational, and
                 // the only way from a horizontal lane onto a vertical one.
                 for mux_index in 0..fabric.input_muxes.len() {
                     link(
@@ -254,14 +278,43 @@ impl Rrg {
             }
         }
 
+        // The IO controller. A write of `None` is a fixed connection.
+        let io_assign = |write: Option<(FieldSlice, u64)>| write.map(|(s, v)| Assign::io(s, v));
+        for pad in 0..fabric.io_inputs.len() {
+            for l in fabric.lanes_for_source(IoSource::InPad(pad)) {
+                link(
+                    Node::InPad(pad),
+                    Node::HSeg { row: l.row, col: 0, lane: l.lane },
+                    EdgeKind::Wire,
+                    io_assign(l.write),
+                );
+            }
+        }
+        for pad in 0..fabric.io_outputs.len() {
+            for l in fabric.lanes_for_output(pad) {
+                link(
+                    Node::HSeg { row: l.row, col: fabric.columns, lane: l.lane },
+                    Node::OutPad(pad),
+                    EdgeKind::Wire,
+                    io_assign(l.write),
+                );
+            }
+        }
+        for pad in fabric.loopable_outputs() {
+            for l in fabric.lanes_for_source(IoSource::OutPad(pad)) {
+                link(
+                    Node::OutPad(pad),
+                    Node::HSeg { row: l.row, col: 0, lane: l.lane },
+                    EdgeKind::OnChipLoop,
+                    io_assign(l.write),
+                );
+            }
+        }
+
+        // Board wiring from the loop-around pool.
         for source in &pool.outputs {
             for sink in &pool.inputs {
-                link(
-                    Node::HSeg { row: source.row, col: fabric.columns, lane: source.lane },
-                    Node::HSeg { row: sink.row, col: 0, lane: sink.lane },
-                    EdgeKind::Loopback,
-                    None,
-                );
+                link(Node::OutPad(source.index), Node::InPad(sink.index), EdgeKind::Loopback, None);
             }
         }
 
@@ -281,31 +334,27 @@ impl Rrg {
         out
     }
 
-    /// The chip input pads, as the nodes they drive.
-    pub fn input_pads(fabric: &Fabric) -> Vec<(String, Node)> {
+    /// The on-chip loops in the graph, as (output pad node, left-edge node).
+    pub fn on_chip_edges(&self) -> Vec<(Node, Node)> {
         let mut out = Vec::new();
-        for (row, lanes) in fabric.io_inputs.iter().enumerate() {
-            for (lane, name) in lanes.iter().enumerate() {
-                out.push((name.clone(), Node::HSeg { row, col: 0, lane }));
+        for id in 0..self.len() {
+            for edge in &self.out[id] {
+                if edge.kind == EdgeKind::OnChipLoop {
+                    out.push((self.node(id), self.node(edge.to)));
+                }
             }
         }
         out
     }
 
-    /// The chip output pads, as the nodes they read.
+    /// The input-side pads, as their nodes.
+    pub fn input_pads(fabric: &Fabric) -> Vec<(String, Node)> {
+        fabric.io_inputs.iter().enumerate().map(|(i, name)| (name.clone(), Node::InPad(i))).collect()
+    }
+
+    /// The output-side pads, as their nodes.
     pub fn output_pads(fabric: &Fabric) -> Vec<(String, Node)> {
-        let mut out = Vec::new();
-        for (row, lanes) in fabric.io_outputs.iter().enumerate() {
-            for (lane, name) in lanes.iter().enumerate() {
-                if let Some(name) = name {
-                    out.push((
-                        name.clone(),
-                        Node::HSeg { row, col: fabric.columns, lane },
-                    ));
-                }
-            }
-        }
-        out
+        fabric.io_outputs.iter().enumerate().map(|(o, name)| (name.clone(), Node::OutPad(o))).collect()
     }
 
     /// Where a column's CSB taps its ring, per select code.
@@ -340,6 +389,8 @@ impl std::fmt::Display for Node {
             Node::Carry { col, row } => write!(f, "CLB({}, {})._carry", col, row),
             Node::In { col, row, mux } => write!(f, "CLB({}, {}) input {}", col, row, mux),
             Node::Const(v) => write!(f, "constant {}", u8::from(*v)),
+            Node::InPad(pad) => write!(f, "input pad {}", pad),
+            Node::OutPad(pad) => write!(f, "output pad {}", pad),
         }
     }
 }

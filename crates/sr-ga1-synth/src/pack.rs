@@ -2,7 +2,7 @@
 //!
 //! Three fabric facts drive everything here.
 //!
-//! * **The flip-flop's data input is hard-wired to its own CLB's operation
+//! * **The flip-flop's data input is hard-wired to its own CLB's LUT
 //!   result.** There is no independent register data path, so a register can
 //!   only ever live on the cell that computes its value. Fusing a DFF into
 //!   its driving cell is therefore not an optimisation, it is the only legal
@@ -16,9 +16,9 @@
 //!   because it is frequently the constraint that decides whether a design
 //!   fits.
 //! * **Reset is global, synchronous, and wins over the enable**, loading the
-//!   constant in config bit 19.
+//!   constant in the CLB's `op_ff_reset_val` bit.
 
-use crate::carry::{CarryPlan, CARRY_CELL};
+use crate::carry::{CarryPlan, CARRY_CELL, CARRY_TAP};
 use crate::genlib::CellLibrary;
 use crate::naming::{NameAllocator, NetNames};
 use crate::netlist::{Bit, Module, SrcLoc};
@@ -73,7 +73,8 @@ impl Signal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Enable {
     /// Capture on every clock edge: lane 3 must carry a constant 1 at this
-    /// CLB's position. Free in row 3, otherwise driven by an upstream CLB.
+    /// CLB's position, driven by an upstream CLB's major mux — so never in
+    /// column 0, whose lane 3 is a chip input.
     Always,
     /// Lane 3 must carry this net at this CLB's position.
     Net(u32),
@@ -84,7 +85,7 @@ pub struct Register {
     /// The net the register drives, read from `_reg`.
     pub q: u32,
     pub enable: Enable,
-    /// Config bit 19: the value a global reset loads.
+    /// `op_ff_reset_val`: the value a global reset loads.
     pub reset_value: bool,
     /// Clock net, traced back to a chip input in Phase 5.
     pub clock: u32,
@@ -103,9 +104,13 @@ pub struct CarryLink {
     /// 0 is the least significant bit, which sits in the bottom row.
     pub index: usize,
     /// For the least significant bit only: an external carry-in, which has to
-    /// arrive on a horizontal lane because row 0's chain input is tied off.
-    /// `None` means the tied-off value is what the adder wants.
+    /// arrive on a lane because row 0's chain input is tied off. It is also how
+    /// one segment of a long adder takes the carry the previous segment's tap
+    /// produced. `None` means the tied-off value is what the adder wants.
     pub carry_in: Option<Signal>,
+    /// A carry tap: the cell directly above a segment's top bit, whose LUT
+    /// copies `carry_in` onto `_op` so the carry becomes an ordinary net.
+    pub tap: bool,
 }
 
 /// One CLB's worth of work: a logic function, optionally with its register.
@@ -113,7 +118,7 @@ pub struct CarryLink {
 pub struct PackedCell {
     pub name: String,
     /// Cell name in the derived library, e.g. `AO21`. For a carry cell this
-    /// is the operation that produces the sum bit.
+    /// is the three-input XOR that produces the sum bit.
     pub gate: String,
     /// Pin k of the gate, in genlib pin order. A carry cell has two: the
     /// addends, with the third input coming from the chain.
@@ -158,7 +163,11 @@ pub struct PackedDesign {
     pub cells: Vec<PackedCell>,
     pub inputs: Vec<PortBit>,
     pub outputs: Vec<PortBit>,
-    /// Carry chains, each listing its cells least significant first.
+    /// Output bits tied to a constant, keyed by the placeholder net their
+    /// `PortBit` carries; they are driven from the constant net, not a cell.
+    pub const_outputs: BTreeMap<u32, bool>,
+    /// Carry chains, each listing its cells least significant first. A chain
+    /// is one column's segment of an adder, ending in its tap if it has one.
     pub chains: Vec<Vec<usize>>,
     /// Clock nets, in first-seen order; each needs a column and a CSB.
     pub clocks: Vec<u32>,
@@ -454,54 +463,66 @@ pub fn pack(
             chains.push(chain);
         }
 
+        // A carry is read by something other than the next bit of its chain
+        // — a wider adder's next segment, an output, other logic. Carry is on
+        // no output mux, so such a carry needs a tap.
+        let read_elsewhere = |co: u32| -> bool {
+            logic.iter().any(|c| c.pins.contains(&Signal::Net(co)))
+                || regs.iter().any(|r| r.d == Signal::Net(co))
+                || module.ports.values().any(|p| {
+                    p.direction == crate::netlist::Direction::Output
+                        && p.bits.iter().any(|b| b.as_net() == Some(co))
+                })
+        };
+
+        // Split each adder into segments a column can hold. A segment whose
+        // top carry is needed — by the next segment, or by anything else —
+        // ends in a tap cell directly above its top bit, so with the tap it
+        // must still fit in the column. The next segment's least significant
+        // bit then takes that carry as an ordinary carry-in on a lane.
+        let max = plan.max_length;
+        let mut segments: Vec<(Vec<usize>, Option<u32>)> = Vec::new();
         for chain in &chains {
-            if chain.len() > plan.max_length {
-                return Err(PackError {
-                    loc: carries[chain[0]].src.clone(),
-                    message: format!(
-                        "this addition is {} bits wide, but a carry chain runs up a single \
-                         column and is at most {} cells long. Split the arithmetic into \
-                         {}-bit pieces, or build the wider adder in the operation core at \
-                         roughly three CLBs per bit.",
-                        chain.len(),
-                        plan.max_length,
-                        plan.max_length
-                    ),
-                });
-            }
-            // The carry-out of the top cell reaches nothing, and no cell's
-            // carry may be read by ordinary logic.
-            for (position, &index) in chain.iter().enumerate() {
-                let Some(co) = carries[index].co else { continue };
-                let feeds_next = position + 1 < chain.len()
-                    && carries[chain[position + 1]].ci == Signal::Net(co);
-                let read_elsewhere = logic.iter().any(|c| c.pins.contains(&Signal::Net(co)))
-                    || regs.iter().any(|r| r.d == Signal::Net(co))
-                    || module.ports.values().any(|p| {
-                        p.direction == crate::netlist::Direction::Output
-                            && p.bits.iter().any(|b| b.as_net() == Some(co))
-                    });
-                if read_elsewhere || (!feeds_next && position + 1 < chain.len()) {
-                    return Err(PackError {
-                        loc: carries[index].src.clone(),
-                        message: format!(
-                            "the carry out of adder bit {} is read by something other than the \
-                             next bit of the same adder. Carry appears on no output mux: the \
-                             only place it goes is the cell directly above, so this value \
-                             cannot be produced. A carry-out has to be rebuilt in the \
-                             operation core.",
-                            position
-                        ),
-                    });
+            let n = chain.len();
+            let needed_out =
+                |end: usize| end < n || carries[chain[end - 1]].co.is_some_and(read_elsewhere);
+            let mut start = 0;
+            while start < n {
+                let mut len = 1;
+                // Grow until a carry inside the segment is needed outside it,
+                // the chain ends, or the column is full.
+                while !carries[chain[start + len - 1]].co.is_some_and(read_elsewhere)
+                    && start + len < n
+                    && len < max
+                {
+                    len += 1;
                 }
+                if needed_out(start + len) && len == max {
+                    if len == 1 {
+                        return Err(PackError {
+                            loc: carries[chain[start]].src.clone(),
+                            message: format!(
+                                "this adder needs a carry out of a {}-cell column, which leaves \
+                                 no row for the cell that taps it",
+                                max
+                            ),
+                        });
+                    }
+                    len -= 1;
+                }
+                let tap = if needed_out(start + len) { carries[chain[start + len - 1]].co } else { None };
+                segments.push((chain[start..start + len].to_vec(), tap));
+                start += len;
             }
         }
 
-        // Turn each adder bit into a cell. The sum is the operation result,
-        // and the third input comes from the chain rather than from routing.
-        let mut cell_of: BTreeMap<usize, usize> = BTreeMap::new();
-        for (chain_index, chain) in chains.iter().enumerate() {
-            for (position, &raw) in chain.iter().enumerate() {
+        // Turn each adder bit into a cell. The sum is the LUT result, and the
+        // third input comes from the chain rather than from routing. A tap
+        // follows its segment's top bit.
+        let mut packed_chains: Vec<Vec<usize>> = Vec::new();
+        for (chain_index, (segment, tap)) in segments.iter().enumerate() {
+            let mut members = Vec::new();
+            for (position, &raw) in segment.iter().enumerate() {
                 let source = &carries[raw];
                 let carry_in = if position == 0 {
                     match source.ci {
@@ -513,25 +534,53 @@ pub fn pack(
                 } else {
                     None
                 };
-                cell_of.insert(raw, logic.len());
+                // A bit both of whose addends are 0 — the width extension
+                // Yosys adds to hold a final carry — sums to its carry-in
+                // alone, which is exactly what a tap computes, without
+                // routing two constants to it.
+                let zero_extension = position > 0
+                    && tap.is_none()
+                    && position + 1 == segment.len()
+                    && source.a == Signal::Const(false)
+                    && source.b == Signal::Const(false);
+                members.push(logic.len());
                 logic.push(PackedCell {
                     name: String::new(),
-                    gate: plan.op_name.clone(),
-                    pins: vec![source.a, source.b],
+                    gate: if zero_extension { CARRY_TAP.to_string() } else { plan.gate.clone() },
+                    pins: if zero_extension { Vec::new() } else { vec![source.a, source.b] },
                     op: source.s,
                     reg: None,
                     src: source.src.clone(),
                     inserted_buffer: false,
-                    carry: Some(CarryLink { chain: chain_index, index: position, carry_in }),
+                    carry: Some(CarryLink {
+                        chain: chain_index,
+                        index: position,
+                        carry_in,
+                        tap: zero_extension,
+                    }),
                 });
             }
-        }
-        // Rewrite the chains to point at packed cell indices.
-        for chain in chains.iter_mut() {
-            for entry in chain.iter_mut() {
-                *entry = cell_of[entry];
+            if let Some(net) = tap {
+                members.push(logic.len());
+                logic.push(PackedCell {
+                    name: String::new(),
+                    gate: CARRY_TAP.to_string(),
+                    pins: Vec::new(),
+                    op: Some(*net),
+                    reg: None,
+                    src: carries[*segment.last().expect("segments are never empty")].src.clone(),
+                    inserted_buffer: false,
+                    carry: Some(CarryLink {
+                        chain: chain_index,
+                        index: segment.len(),
+                        carry_in: None,
+                        tap: true,
+                    }),
+                });
             }
+            packed_chains.push(members);
         }
+        chains = packed_chains;
     }
 
     for (i, cell) in logic.iter().enumerate() {
@@ -541,9 +590,7 @@ pub fn pack(
     }
 
     let buffer_gate = library
-        .cells
-        .iter()
-        .find(|c| c.arity == 1 && c.table == [false, true])
+        .buffer()
         .ok_or_else(|| PackError {
             loc: None,
             message: "the fabric's cell library has no buffer, so a register fed by a chip \
@@ -623,6 +670,14 @@ pub fn pack(
             .and_then(|r| names.get(r.q).map(|s| s.to_string()))
             .or_else(|| cell.op.and_then(|n| names.get(n).map(|s| s.to_string())))
             .unwrap_or_else(|| cell.gate.to_lowercase());
+        // A carry between two segments of one adder has only a Yosys-made
+        // name, which says nothing.
+        let tap = cell.carry.as_ref().is_some_and(|l| l.tap);
+        let preferred = if tap && preferred.starts_with("_auto") {
+            "carry".to_string()
+        } else {
+            preferred
+        };
         cell.name = allocator.unique(&preferred);
     }
 
@@ -657,9 +712,47 @@ pub fn pack(
     // ---- ports -------------------------------------------------------------
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
+    let mut const_outputs = BTreeMap::new();
     for (port_name, port) in &module.ports {
+        let is_output = port.direction == crate::netlist::Direction::Output;
         for (index, bit) in port.bits.iter().enumerate() {
-            let Some(net) = bit.as_net() else { continue };
+            let bit_name = || {
+                if port.bits.len() == 1 {
+                    crate::naming::sanitise(port_name)
+                } else {
+                    format!("{}[{}]", crate::naming::sanitise(port_name), index)
+                }
+            };
+            let net = match *bit {
+                Bit::Net(net) => net,
+                // An output tied to a constant still has to reach its pad; it
+                // is driven from the constant net, under a placeholder net
+                // number no real net uses.
+                Bit::Zero | Bit::One if is_output => {
+                    let net = u32::MAX - const_outputs.len() as u32;
+                    const_outputs.insert(net, *bit == Bit::One);
+                    outputs.push(PortBit {
+                        name: bit_name(),
+                        net,
+                        port: port_name.trim_start_matches('\\').to_string(),
+                        index,
+                    });
+                    continue;
+                }
+                // An output nothing drives would silently disappear, and a
+                // design missing an output is not the design that was written.
+                Bit::X | Bit::Z if is_output => {
+                    return Err(PackError {
+                        loc: None,
+                        message: format!(
+                            "output {} is never driven (it is undefined after elaboration). \
+                             Check that everything it depends on is declared and assigned.",
+                            bit_name()
+                        ),
+                    });
+                }
+                _ => continue,
+            };
             let name = names
                 .get(net)
                 .map(|s| s.to_string())
@@ -697,6 +790,7 @@ pub fn pack(
         chains,
         inputs,
         outputs,
+        const_outputs,
         clocks,
         reset: resets.into_iter().next(),
         names,

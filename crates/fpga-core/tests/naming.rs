@@ -21,7 +21,9 @@ fn default_configuration_names() {
     // Left edge: reserved IO names straight from the input controller.
     assert_eq!(namer.net_name(nets.horz_in(0, 0, 0)), "input_0");
     assert_eq!(namer.net_name(nets.horz_in(0, 2, 3)), "ddio_in_1");
-    assert_eq!(namer.net_name(nets.horz_in(0, 3, 1)), "fixed_one");
+    assert_eq!(namer.net_name(nets.horz_in(0, 3, 3)), "input_9");
+    // The all-zero IO configuration points every row's muxed lanes at input_0.
+    assert_eq!(namer.net_name(nets.horz_in(0, 3, 1)), "input_0");
 
     // One column in: minor lanes carry the previous CLB's op, major lanes the
     // default constant zero.
@@ -41,6 +43,26 @@ fn default_configuration_names() {
         assert_eq!(namer.clock_name(&nets.clocks[col]), format!("CLB{}_3_op", col));
         assert_eq!(nets.clocks[col].source_csb, col);
     }
+}
+
+/// An on-chip loop is a wire, not a new net: the lane it feeds carries the
+/// name of whatever leaves the right edge on the lane the output selects.
+#[test]
+fn an_on_chip_loop_carries_the_name_round() {
+    let f = fabric();
+    let mut d = Design::new(&f);
+    d.set_io(&f, "output_mux_sel2", 4).unwrap(); // output_2 <- row 1 lane 0
+    d.set_io(&f, "input_mux_sel3a", 14).unwrap(); // row 3 lane 0 <- output_2
+    for col in 1..f.columns {
+        d.set_clb(&f, col, 1, "minor_horz_sel", 0b01).unwrap();
+    }
+    let nets = resolve(&f, &d);
+    let namer = Namer::new(&f, &d);
+    assert_eq!(namer.net_name(nets.horz_in(0, 3, 0)), "CLB0_1_op");
+    assert_eq!(
+        nets.horz_in(0, 3, 0),
+        NetOrigin::ClbOutput { col: 0, row: 1, kind: OutputKind::Op }
+    );
 }
 
 #[test]

@@ -1,12 +1,14 @@
 //! The constraints file.
 //!
-//! Today this carries one thing: the pads that are physically wired
-//! output-back-to-input on the board, which the router may then use as
-//! ordinary routing resources. That is board wiring, not a property of the
-//! chip, which is why it lives here rather than in `fabric.toml`.
+//! It carries pin locks, DDIO declarations, instance placement, clock
+//! assignment, and the pads that are physically wired output-back-to-input on
+//! the board, which the router may then use as ordinary routing resources.
+//! Board wiring is not a property of the chip, which is why it lives here
+//! rather than in `fabric.toml` — and it is rarely needed, because the IO
+//! controller can read `output_0..3` back onto the left edge on-chip without
+//! any wiring at all. A pool adds to that, it does not replace it.
 //!
-//! It also carries pin locks, DDIO declarations, instance placement and clock
-//! assignment. Everything here is validated against the fabric when the file is
+//! Everything here is validated against the fabric when the file is
 //! read, and against the design once it has been elaborated — a constraint that
 //! names a signal the design does not have is an error, not a shrug. A
 //! constraint that makes fitting impossible is reported as such rather than
@@ -41,12 +43,15 @@ fn line_at(src: &str, offset: usize) -> usize {
     src[..offset.min(src.len())].bytes().filter(|&b| b == b'\n').count() + 1
 }
 
-/// A chip pad, resolved to the row and lane it occupies.
+/// A chip pad, resolved to its side and index in the fabric's pad list for
+/// that side. Which lane it reaches is IO controller configuration, chosen by
+/// the router.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pad {
     pub name: String,
-    pub row: usize,
-    pub lane: usize,
+    /// True for an input-side pad (`io_inputs`), false for an output-side one.
+    pub input: bool,
+    pub index: usize,
 }
 
 /// Pads available for loop-around wiring.
@@ -73,8 +78,8 @@ impl LoopbackPool {
 /// One DDIO pad bound to three design nets.
 ///
 /// DDIO is never inferred from SystemVerilog: the pad drives `out` when `dir` is
-/// high and gates `in` to zero, which is a board-level decision. An
-/// unconstrained DDIO pad stays at its default with its input path gated off.
+/// high, and `in` then reads that output back, which is a board-level decision.
+/// An unconstrained DDIO pad has its direction tied to 0, so it stays an input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdioBinding {
     /// Index into the fabric's DDIO list.
@@ -165,11 +170,7 @@ impl Constraints {
         let mut loopback = LoopbackPool::default();
         if let Some(raw_pool) = &raw.loopback {
             let allow_ddio = raw_pool.allow_ddio;
-            let ddio: Vec<&str> = fabric
-                .ddio
-                .iter()
-                .flat_map(|d| [d.input.as_str(), d.output.as_str(), d.dir.as_str()])
-                .collect();
+            let ddio: Vec<&str> = fabric.ddio_pad_names();
 
             for entry in &raw_pool.outputs {
                 let name = entry.get_ref();
@@ -303,22 +304,15 @@ impl Constraints {
             if ddio.iter().any(|d: &DdioBinding| d.pin == index) {
                 return Err(fail(line, format!("DDIO pad {} is declared twice", index)));
             }
-            let resolve = |name: &str, what: &str| -> Result<Pad, ConstraintError> {
-                input_pad(fabric, name).or_else(|| output_pad(fabric, name)).ok_or_else(|| {
-                    fail(
-                        line,
-                        format!("the fabric's DDIO {} pad \"{}\" is in no IO map row", what, name),
-                    )
-                })
-            };
+            let pad = |name: &String, input: bool, index: usize| Pad { name: name.clone(), input, index };
             ddio.push(DdioBinding {
                 pin: index,
                 input: decl.input.clone(),
                 output: decl.out.clone(),
                 dir: decl.dir.clone(),
-                in_pad: resolve(&spec.input, "input")?,
-                out_pad: resolve(&spec.output, "output")?,
-                dir_pad: resolve(&spec.dir, "direction")?,
+                in_pad: pad(&fabric.io_inputs[spec.input], true, spec.input),
+                out_pad: pad(&fabric.io_outputs[spec.output], false, spec.output),
+                dir_pad: pad(&fabric.io_outputs[spec.dir], false, spec.dir),
             });
         }
 
@@ -404,44 +398,24 @@ fn find_section(src: &str, name: &str) -> Option<usize> {
         .map(|index| index + 1)
 }
 
-fn output_pad(fabric: &Fabric, name: &str) -> Option<Pad> {
-    for (row, lanes) in fabric.io_outputs.iter().enumerate() {
-        for (lane, pad) in lanes.iter().enumerate() {
-            if pad.as_deref() == Some(name) {
-                return Some(Pad { name: name.to_string(), row, lane });
-            }
-        }
-    }
-    None
+pub fn output_pad(fabric: &Fabric, name: &str) -> Option<Pad> {
+    fabric
+        .output_pad(name)
+        .map(|index| Pad { name: name.to_string(), input: false, index })
 }
 
-fn input_pad(fabric: &Fabric, name: &str) -> Option<Pad> {
-    // The reserved constant names are driven by the IO controller, not by a pin.
-    if name == fabric.naming.constant_zero || name == fabric.naming.constant_one {
-        return None;
-    }
-    for (row, lanes) in fabric.io_inputs.iter().enumerate() {
-        for (lane, pad) in lanes.iter().enumerate() {
-            if pad == name {
-                return Some(Pad { name: name.to_string(), row, lane });
-            }
-        }
-    }
-    None
+pub fn input_pad(fabric: &Fabric, name: &str) -> Option<Pad> {
+    fabric
+        .input_pad(name)
+        .map(|index| Pad { name: name.to_string(), input: true, index })
 }
 
 fn list_outputs(fabric: &Fabric) -> Vec<String> {
-    fabric.io_outputs.iter().flatten().flatten().cloned().collect()
+    fabric.io_outputs.clone()
 }
 
 fn list_inputs(fabric: &Fabric) -> Vec<String> {
-    fabric
-        .io_inputs
-        .iter()
-        .flatten()
-        .filter(|n| **n != fabric.naming.constant_zero && **n != fabric.naming.constant_one)
-        .cloned()
-        .collect()
+    fabric.io_inputs.clone()
 }
 
 // ---------------------------------------------------------------------------

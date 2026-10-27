@@ -12,10 +12,10 @@ fn fabric() -> Fabric {
 }
 
 /// Same design as the simulator tests: column 0 clocked from input_0, with
-/// CLB(0,0)'s register routed to output lane 3.
+/// CLB(0,0)'s register routed to row 0 lane 3 and out on output_3.
 fn clocked_design(f: &Fabric) -> Design {
     let mut d = Design::new(f);
-    d.set_clb(f, 0, 0, "operation_select", 1).unwrap();
+    d.set_clb(f, 0, 0, "lut", f.preset_value("BUF_A").unwrap()).unwrap();
     d.set_clb(f, 0, 1, "minor_vert_sel", 0b0100).unwrap();
     d.set_clb(f, 0, 2, "minor_vert_sel", 0b0001).unwrap();
     d.set_clb(f, 0, 3, "minor_vert_sel", 0b0100).unwrap();
@@ -24,6 +24,7 @@ fn clocked_design(f: &Fabric) -> Design {
     for col in 1..f.columns {
         d.set_clb(f, col, 0, "major_horz3_sel", 3).unwrap();
     }
+    d.set_io(f, "output_mux_sel3", 3).unwrap();
     d
 }
 
@@ -87,17 +88,15 @@ fn derived_clock_is_informational_and_names_the_signal() {
 }
 
 #[test]
-fn ddio_feedback_is_reported_as_potential_loop() {
+fn ddio_read_back_is_reported_as_potential_loop() {
     let f = fabric();
     let mut d = Design::new(&f);
-    d.set_clb(&f, 0, 2, "operation_select", 1).unwrap();
-    d.set_clb(&f, 0, 3, "minor_horz_sel", 0b01).unwrap();
-    d.set_clb(&f, 0, 3, "major_horz2_sel", 2).unwrap();
-    d.set_clb(&f, 0, 3, "operation_select", 4).unwrap();
-    d.set_clb(&f, 1, 3, "operation_select", 2).unwrap();
-    for col in 2..f.columns {
-        d.set_clb(&f, col, 3, "minor_horz_sel", 0b01).unwrap();
+    d.set_clb(&f, 0, 2, "lut", f.preset_value("INV_C").unwrap()).unwrap();
+    for col in 1..f.columns {
+        d.set_clb(&f, col, 2, "minor_horz_sel", 0b01).unwrap();
     }
+    d.set_io(&f, "output_mux_sel_ddio0", 8).unwrap();
+    d.set_io(&f, "output_mux_sel_ddio_dir0", 8).unwrap();
     let items = check(&f, &d);
     assert!(
         items
@@ -115,6 +114,7 @@ fn vertical_ring_loop_is_reported() {
     // input c <- v_in[0] (a combinational lane), then pass the op back
     // around the ring to close a loop through this cell's own logic.
     d.set_clb(&f, 0, 0, "input_mux_c_sel", 2).unwrap();
+    d.set_clb(&f, 0, 0, "lut", f.preset_value("XOR3").unwrap()).unwrap();
     d.set_clb(&f, 0, 1, "minor_vert_sel", 0b0001).unwrap();
     d.set_clb(&f, 0, 2, "minor_vert_sel", 0b0100).unwrap();
     d.set_clb(&f, 0, 3, "minor_vert_sel", 0b0001).unwrap();
@@ -128,6 +128,46 @@ fn vertical_ring_loop_is_reported() {
     );
 }
 
+/// A LUT that ignores the input the ring returns on cannot oscillate through
+/// it, so the same wiring with a `BUF_A` is not a loop.
+#[test]
+fn a_ring_through_an_ignored_input_is_not_a_loop() {
+    let f = fabric();
+    let mut d = Design::new(&f);
+    d.set_clb(&f, 0, 0, "input_mux_c_sel", 2).unwrap();
+    d.set_clb(&f, 0, 0, "lut", f.preset_value("BUF_A").unwrap()).unwrap();
+    d.set_clb(&f, 0, 1, "minor_vert_sel", 0b0001).unwrap();
+    d.set_clb(&f, 0, 2, "minor_vert_sel", 0b0100).unwrap();
+    d.set_clb(&f, 0, 3, "minor_vert_sel", 0b0001).unwrap();
+    assert!(fpga_core::drc::combinational_loops(&f, &d).is_empty());
+}
+
+#[test]
+fn an_unclaimed_ddio_direction_following_a_signal_warns() {
+    let f = fabric();
+    let mut d = Design::new(&f);
+    for col in 0..f.columns {
+        d.set_clb(&f, col, 0, "minor_horz_sel", 0b01).unwrap();
+    }
+    // ddio_dir_0 now follows input_0, straight across row 0.
+    let items = check(&f, &d);
+    let warn = items
+        .iter()
+        .find(|i| i.severity == Severity::Warning && i.message.contains("ddio_dir_0"))
+        .expect("expected the DDIO direction warning");
+    assert!(warn.message.contains("input_0"), "got: {}", warn.message);
+    // Naming the pad says the design means it.
+    let dir = fpga_core::config::IoPad::by_name(&f, "ddio_dir_0").unwrap();
+    d.rename_io(&f, dir, "bus_oe").unwrap();
+    assert!(!check(&f, &d).iter().any(|i| i.message.contains("ddio_dir_0 follows")));
+}
+
+#[test]
+fn the_empty_design_does_not_warn_about_ddio() {
+    let f = fabric();
+    assert!(!check(&f, &Design::new(&f)).iter().any(|i| i.message.contains("ddio_dir")));
+}
+
 #[test]
 fn tracer_records_and_exports_vcd() {
     let f = fabric();
@@ -136,10 +176,15 @@ fn tracer_records_and_exports_vcd() {
     stim.set("input_0", vec![false, true]);
     stim.set("input_3", vec![true]);
 
-    let ids = vec!["clk:0".to_string(), "ff:0:0".to_string(), "bogus:9".to_string()];
+    let ids = vec![
+        "clk:0".to_string(),
+        "ff:0:0".to_string(),
+        "bogus:9".to_string(),
+        "in:input_0".to_string(),
+    ];
     let (mut tracer, warnings) = Tracer::new(&f, &ids);
     assert_eq!(warnings.len(), 1, "bad id dropped with warning");
-    assert_eq!(tracer.ids.len(), 2);
+    assert_eq!(tracer.ids.len(), 3);
 
     let (mut state, s0) = SimState::new(&f, &d, &stim).unwrap();
     tracer.sample(&s0);
@@ -152,10 +197,12 @@ fn tracer_records_and_exports_vcd() {
     // the tick after the first rising edge.
     let clk: Vec<bool> = tracer.history.iter().map(|r| r[0]).collect();
     let ff: Vec<bool> = tracer.history.iter().map(|r| r[1]).collect();
+    let input: Vec<bool> = tracer.history.iter().map(|r| r[2]).collect();
     assert_eq!(clk, vec![false, true, false, true, false]);
     assert_eq!(ff, vec![false, false, true, true, true]);
+    assert_eq!(input, clk, "the clock is input_0 buffered");
 
-    let vcd = tracer.to_vcd(&["CLB0_0_op".to_string(), "CLB0_0_reg".to_string()]);
+    let vcd = tracer.to_vcd(&["CLB0_0_op".to_string(), "CLB0_0_reg".to_string(), "input_0".to_string()]);
     assert!(vcd.contains("$var wire 1 ! CLB0_0_op $end"));
     assert!(vcd.contains("$var wire 1 \" CLB0_0_reg $end"));
     assert!(vcd.contains("#0\n$dumpvars"));

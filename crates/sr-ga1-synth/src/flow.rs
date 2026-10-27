@@ -1,7 +1,7 @@
 //! The flow: elaborate, map, pack, then search for a placement that routes.
 //!
 //! The outer loop is the point of this module. A single annealing run costs
-//! milliseconds on a 28-CLB fabric, so the tool does not place once and hope;
+//! milliseconds on a fabric this size, so the tool does not place once and hope;
 //! it places from many seeds, routes each, and keeps the best result until
 //! either the design fits or the time budget is spent. Failure feeds back:
 //! congestion from a failed routing becomes placement cost on the next
@@ -246,11 +246,7 @@ pub fn front(options: &Options, progress: &mut Progress) -> Result<CheckOutcome,
             diagnostics: violations.iter().map(|d| d.to_string()).collect(),
         });
     }
-    let ddio_nets: Vec<String> = fabric
-        .ddio
-        .iter()
-        .flat_map(|d| [d.input.clone(), d.output.clone(), d.dir.clone()])
-        .collect();
+    let ddio_nets: Vec<String> = fabric.ddio_pad_names().into_iter().map(String::from).collect();
     let ddio_declared: Vec<String> = constraints
         .ddio
         .iter()
@@ -291,7 +287,7 @@ pub fn front(options: &Options, progress: &mut Progress) -> Result<CheckOutcome,
     validate_constraints(&constraints, &packed, &fabric, options)?;
 
     // Feedback is a fabric capability, not a placement problem: if a
-    // registered value cannot get back to an operation input, no placement can
+    // registered value cannot get back to a LUT input, no placement can
     // build a design that needs it. Say so now rather than spending the whole
     // time budget failing to route.
     if !fabric.register_feedback_possible() && constraints.loopback.is_empty() {
@@ -374,6 +370,36 @@ pub fn run(options: &Options, progress: &mut Progress) -> Result<Outcome, FlowEr
     let rrg = Rrg::with_loopback(&fabric, &constraints.loopback);
     let target =
         Target::with_carry(&fabric, &library, carry.as_ref(), &constraints);
+
+    // Every port needs a pad. The reset takes none, and a pin lock or DDIO
+    // binding brings its own; the rest share whatever the constraints left
+    // free. Running out is a constraints problem, so say so here rather than
+    // let it surface as a net with no driver.
+    for (side, ports, free) in [
+        ("input", &packed.inputs, target.input_pads.len()),
+        ("output", &packed.outputs, target.output_pads.len()),
+    ] {
+        let needed = ports
+            .iter()
+            .filter(|p| packed.reset != Some(p.net) && target.forced_pad(&p.name).is_none())
+            .map(|p| p.net)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        if needed > free {
+            return Err(FlowError {
+                message: format!(
+                    "the design needs {} {} pad(s) of its own but only {} are free: DDIO pads, \
+                     locked pins and every input in the loop-around pool are reserved",
+                    needed, side, free
+                ),
+                diagnostics: vec![format!(
+                    "loop-around pool: {} input(s), {} output(s)",
+                    constraints.loopback.inputs.len(),
+                    constraints.loopback.outputs.len()
+                )],
+            });
+        }
+    }
     let placer = Placer::new(&packed, &target);
     let (sweeps, max_attempts) = options.effort.schedule();
 
@@ -505,7 +531,7 @@ fn failure_report(
 ) -> FlowError {
     let mut diagnostics = Vec::new();
     diagnostics.push(format!(
-        "{} of {} CLBs used by logic before routing ({} register(s), {} unconditional, which          want the row whose lane {} enters as a constant 1)",
+        "{} of {} CLBs used by logic before routing ({} register(s), {} unconditional, which          need a constant 1 on lane {} from an upstream CLB, so never column 0)",
         packed.clb_count(),
         fabric.clb_count(),
         packed.register_count(),
@@ -619,9 +645,8 @@ fn validate_constraints(
         diagnostics,
     };
 
-    let is_input = |pad: &str| fabric.io_inputs.iter().flatten().any(|n| n == pad);
-    let is_output =
-        |pad: &str| fabric.io_outputs.iter().flatten().flatten().any(|n| n == pad);
+    let is_input = |pad: &str| fabric.input_pad(pad).is_some();
+    let is_output = |pad: &str| fabric.output_pad(pad).is_some();
     let input_names: Vec<&str> = packed.inputs.iter().map(|p| p.name.as_str()).collect();
     let output_names: Vec<&str> = packed.outputs.iter().map(|p| p.name.as_str()).collect();
 
@@ -710,6 +735,12 @@ fn validate_constraints(
     // one of its cells has to agree with the chain's geometry.
     for (index, chain) in packed.chains.iter().enumerate() {
         let lsb_row = 0;
+        // A chain whose first bit takes its carry-in on a lane may start on
+        // any row; one fed from the tied-off edge starts at the edge.
+        let floating = chain
+            .first()
+            .and_then(|&c| packed.cells[c].carry.as_ref())
+            .is_some_and(|link| link.carry_in.is_some());
         let mut column: Option<(usize, &str)> = None;
         for (position, &cell) in chain.iter().enumerate() {
             let name = packed.cells[cell].name.as_str();
@@ -717,7 +748,7 @@ fn validate_constraints(
                 continue;
             };
             let wanted = lsb_row + position;
-            if lock.row != wanted {
+            if !floating && lock.row != wanted {
                 return Err(fail(
                     format!(
                         "\"{}\" is bit {} of an adder, so the carry chain requires it in row {},                          but it is pinned to row {}",

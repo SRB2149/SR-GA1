@@ -117,12 +117,17 @@ pub struct OutputMux {
     pub sources: Vec<Source>,
 }
 
-/// One operation of the fixed core. `table[i]` is the result when input mux
-/// k's output equals bit k of `i` (input "a" is bit 0).
+/// The 3-input lookup table. `order` lists input mux indices most-significant
+/// first, so the LUT output is bit `index` of the `field` value, where `index`
+/// is built from the input values in that order.
 #[derive(Debug, Clone)]
-pub struct Operation {
-    pub name: String,
-    pub table: Vec<bool>,
+pub struct LutSpec {
+    /// Index into `clb_fields` of the truth-table field.
+    pub field: usize,
+    /// Input mux indices, most-significant index bit first.
+    pub order: Vec<usize>,
+    /// Display names for well-known values, in file order.
+    pub presets: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,16 +147,46 @@ pub struct CsbClock {
     pub couple_field: usize,
 }
 
-#[derive(Debug, Clone)]
+/// A dual-direction pad, as indices into the pad lists: `input` into
+/// `io_inputs`, `output` and `dir` into `io_outputs`.
+#[derive(Debug, Clone, Copy)]
 pub struct Ddio {
-    pub input: String,
-    pub output: String,
-    pub dir: String,
+    pub input: usize,
+    pub output: usize,
+    pub dir: usize,
+}
+
+/// Something the IO controller can put onto a left-edge lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoSource {
+    /// An input-side pad (index into `io_inputs`).
+    InPad(usize),
+    /// The value the IO controller drives onto an output-side pad (index into
+    /// `io_outputs`) — an on-chip loop from the right edge back to the left.
+    OutPad(usize),
+}
+
+/// What enters one left-edge lane.
+#[derive(Debug, Clone, Copy)]
+pub enum LeftLane {
+    /// An input mux over `io_mux_sources`, selected by an IO config field.
+    Mux(FieldSlice),
+    Fixed(IoSource),
+}
+
+/// What drives one output-side pad from the right edge.
+#[derive(Debug, Clone, Copy)]
+pub enum PadDrive {
+    /// An output mux over every right-edge lane; select code
+    /// `row * horz_lanes + lane`.
+    Mux(FieldSlice),
+    Fixed { row: usize, lane: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainCells {
     Clb,
+    Io,
     Csb,
 }
 
@@ -159,6 +194,7 @@ pub enum ChainCells {
 pub enum ChainOrder {
     RowMajor,
     ColumnAscending,
+    Single,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +207,7 @@ pub struct ChainGroup {
 pub struct Naming {
     pub clb: String,
     pub csb: String,
+    pub io: String,
     pub suffix_op: String,
     pub suffix_reg: String,
     pub suffix_carry: String,
@@ -190,23 +227,29 @@ pub struct Fabric {
     pub vertical_ring: bool,
     pub clb_fields: Vec<Field>,
     pub input_muxes: Vec<InputMux>,
-    /// The config field slice holding the operation select code.
-    pub op_select: FieldSlice,
-    /// Indexed by operation select code.
-    pub operations: Vec<Operation>,
+    pub lut: LutSpec,
+    /// Indexed like the LUT (see [`LutSpec::order`]).
     pub carry_table: Vec<bool>,
     pub carry: CarrySpec,
     pub ff: FfSpec,
     pub output_muxes: Vec<OutputMux>,
     pub csb_fields: Vec<Field>,
     pub csb_clock: CsbClock,
-    /// `io_inputs[row][lane]`: reserved net name entering at the left edge.
-    pub io_inputs: Vec<Vec<String>>,
-    /// `io_outputs[row][lane]`: chip output read at the right edge, `None` if
-    /// the lane is unused there.
-    pub io_outputs: Vec<Vec<Option<String>>>,
+    pub io_fields: Vec<Field>,
+    /// Input-side pad names: the chip inputs, then the fabric side of each DDIO.
+    pub io_inputs: Vec<String>,
+    /// Output-side pad names: the chip outputs, then each DDIO's out and dir.
+    pub io_outputs: Vec<String>,
     pub ddio: Vec<Ddio>,
+    /// Sources of every left-edge input mux, in select-code order.
+    pub io_mux_sources: Vec<IoSource>,
+    /// `io_left[row][lane]`.
+    pub io_left: Vec<Vec<LeftLane>>,
+    /// Per output-side pad, indexed like `io_outputs`.
+    pub io_drive: Vec<PadDrive>,
     pub chain: Vec<ChainGroup>,
+    /// The bit sent ahead of the configuration, if the chip expects one.
+    pub start_bit: Option<bool>,
     pub naming: Naming,
 }
 
@@ -235,8 +278,19 @@ impl Fabric {
         self.csb_fields.iter().map(|f| f.width).sum()
     }
 
+    pub fn io_bits(&self) -> usize {
+        self.io_fields.iter().map(|f| f.width).sum()
+    }
+
+    /// Configuration bits in the chain (excluding any start bit).
     pub fn total_bits(&self) -> usize {
-        self.columns * self.rows * self.clb_bits() + self.columns * self.csb_bits()
+        self.columns * self.rows * self.clb_bits() + self.io_bits() + self.columns * self.csb_bits()
+    }
+
+    /// Bits in a complete transmission: the start bit, if any, plus the
+    /// configuration.
+    pub fn stream_bits(&self) -> usize {
+        self.total_bits() + self.start_bit.is_some() as usize
     }
 
     pub fn clb_field(&self, name: &str) -> Option<&Field> {
@@ -247,24 +301,64 @@ impl Fabric {
         self.csb_fields.iter().find(|f| f.name == name)
     }
 
-    pub fn operation_by_name(&self, name: &str) -> Option<usize> {
-        self.operations.iter().position(|op| op.name == name)
+    pub fn io_field(&self, name: &str) -> Option<&Field> {
+        self.io_fields.iter().find(|f| f.name == name)
     }
 
-    /// Evaluate operation `code` on the input mux outputs (input "a" first).
-    /// `None` if the code or input count doesn't match the fabric.
-    pub fn eval_operation(&self, code: usize, inputs: &[bool]) -> Option<bool> {
+    /// The truth-table index for these input mux outputs (listed in
+    /// `input_muxes` order, input "a" first).
+    pub fn lut_index(&self, inputs: &[bool]) -> usize {
+        self.lut.order.iter().fold(0, |acc, &m| (acc << 1) | inputs[m] as usize)
+    }
+
+    /// Evaluate a LUT value on the input mux outputs (input "a" first).
+    /// `None` if the input count doesn't match the fabric.
+    pub fn eval_lut(&self, lut: u64, inputs: &[bool]) -> Option<bool> {
         if inputs.len() != self.input_muxes.len() {
             return None;
         }
-        self.operations.get(code).map(|op| op.table[table_index(inputs)])
+        Some((lut >> self.lut_index(inputs)) & 1 != 0)
     }
 
     pub fn eval_carry(&self, inputs: &[bool]) -> Option<bool> {
         if inputs.len() != self.input_muxes.len() {
             return None;
         }
-        Some(self.carry_table[table_index(inputs)])
+        Some(self.carry_table[self.lut_index(inputs)])
+    }
+
+    /// The first preset whose value matches `lut`, if any.
+    pub fn preset_name(&self, lut: u64) -> Option<&str> {
+        self.lut.presets.iter().find(|(_, v)| *v == lut).map(|(n, _)| n.as_str())
+    }
+
+    pub fn preset_value(&self, name: &str) -> Option<u64> {
+        self.lut.presets.iter().find(|(n, _)| n == name).map(|(_, v)| *v)
+    }
+
+    /// The right-edge lane an output mux select code picks.
+    pub fn drive_lane(&self, code: usize) -> (usize, usize) {
+        (code / self.horz_lanes, code % self.horz_lanes)
+    }
+
+    pub fn input_pad(&self, name: &str) -> Option<usize> {
+        self.io_inputs.iter().position(|n| n == name)
+    }
+
+    pub fn output_pad(&self, name: &str) -> Option<usize> {
+        self.io_outputs.iter().position(|n| n == name)
+    }
+
+    /// The DDIO whose fabric-side input is this input-side pad.
+    pub fn ddio_of_input(&self, pad: usize) -> Option<&Ddio> {
+        self.ddio.iter().find(|d| d.input == pad)
+    }
+
+    pub fn io_source_name(&self, src: IoSource) -> &str {
+        match src {
+            IoSource::InPad(i) => &self.io_inputs[i],
+            IoSource::OutPad(o) => &self.io_outputs[o],
+        }
     }
 
     pub fn clb_name(&self, col: usize, row: usize) -> String {
@@ -277,13 +371,10 @@ impl Fabric {
     pub fn csb_name(&self, col: usize) -> String {
         self.naming.csb.replace("{col}", &col.to_string())
     }
-}
 
-fn table_index(inputs: &[bool]) -> usize {
-    inputs
-        .iter()
-        .enumerate()
-        .fold(0, |acc, (i, &b)| acc | ((b as usize) << i))
+    pub fn io_name(&self) -> String {
+        self.naming.io.clone()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +421,7 @@ struct RawField {
 struct RawClb {
     fields: Vec<RawField>,
     input_muxes: Vec<RawInputMux>,
-    operation: RawOperation,
+    lut: RawLut,
     carry: RawCarry,
     ff: RawFf,
     output_muxes: Vec<RawOutputMux>,
@@ -353,18 +444,19 @@ struct RawInputMux {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawOperation {
-    select: Spanned<String>,
-    ops: Vec<RawOp>,
+struct RawLut {
+    field: Spanned<String>,
+    index: Spanned<Vec<Spanned<String>>>,
     carry_table: Spanned<Vec<u8>>,
+    #[serde(default)]
+    presets: Vec<RawPreset>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawOp {
-    code: Spanned<u32>,
+struct RawPreset {
     name: Spanned<String>,
-    table: Spanned<Vec<u8>>,
+    value: Spanned<u64>,
 }
 
 #[derive(Deserialize)]
@@ -403,9 +495,13 @@ struct RawCsbClock {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawIo {
-    inputs: Spanned<Vec<Vec<String>>>,
-    outputs: Spanned<Vec<Vec<String>>>,
+    fields: Vec<RawField>,
+    inputs: Spanned<Vec<Spanned<String>>>,
+    outputs: Spanned<Vec<Spanned<String>>>,
     ddio: Vec<RawDdio>,
+    input_mux_sources: Spanned<Vec<Spanned<String>>>,
+    left: Spanned<Vec<Vec<Spanned<String>>>>,
+    drive: Spanned<std::collections::BTreeMap<String, Spanned<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -421,6 +517,7 @@ struct RawDdio {
 #[serde(deny_unknown_fields)]
 struct RawBitstream {
     chain: Spanned<Vec<RawChainGroup>>,
+    start_bit: Option<Spanned<u8>>,
 }
 
 #[derive(Deserialize)]
@@ -435,6 +532,7 @@ struct RawChainGroup {
 struct RawNaming {
     clb: Spanned<String>,
     csb: Spanned<String>,
+    io: String,
     suffix_op: String,
     suffix_reg: String,
     suffix_carry: String,
@@ -463,10 +561,10 @@ impl<'a> Ctx<'a> {
 fn build(src: &str, raw: RawFile) -> Result<Fabric, FabricError> {
     let ctx = Ctx { src };
 
-    if *raw.schema.get_ref() != 1 {
+    if *raw.schema.get_ref() != 2 {
         return Err(ctx.err(
             raw.schema.span(),
-            format!("unsupported schema version {} (expected 1)", raw.schema.get_ref()),
+            format!("unsupported schema version {} (expected 2)", raw.schema.get_ref()),
         ));
     }
 
@@ -507,44 +605,38 @@ fn build(src: &str, raw: RawFile) -> Result<Fabric, FabricError> {
     }
     let table_len = 1usize << input_muxes.len();
 
-    // Operation core.
-    let op_select = parse_select(&ctx, &clb_fields, &raw.clb.operation.select, "clb.operation")?;
-    let op_count = 1usize << op_select.width;
-    let mut operations: Vec<Option<Operation>> = vec![None; op_count];
-    for op in &raw.clb.operation.ops {
-        let code = *op.code.get_ref() as usize;
-        if code >= op_count {
-            return Err(ctx.err(
-                op.code.span(),
-                format!(
-                    "operation \"{}\": code {} out of range for {}-bit select (max {})",
-                    op.name.get_ref(), code, op_select.width, op_count - 1
-                ),
-            ));
+    // Lookup table.
+    let raw_lut = &raw.clb.lut;
+    let lut_field = require_field(&ctx, &clb_fields, &raw_lut.field, table_len, "clb.lut.field")?;
+    let mut order = Vec::new();
+    for tok in raw_lut.index.get_ref() {
+        let m = input_muxes.iter().position(|m| m.name == *tok.get_ref()).ok_or_else(|| {
+            ctx.err(tok.span(), format!("clb.lut.index: \"{}\" is not an input mux", tok.get_ref()))
+        })?;
+        if order.contains(&m) {
+            return Err(ctx.err(tok.span(), format!("clb.lut.index: \"{}\" appears twice", tok.get_ref())));
         }
-        if operations[code].is_some() {
-            return Err(ctx.err(
-                op.code.span(),
-                format!("operation \"{}\": code {} is already used", op.name.get_ref(), code),
-            ));
-        }
-        let table = parse_table(&ctx, &op.table, table_len, &format!("operation \"{}\"", op.name.get_ref()))?;
-        operations[code] = Some(Operation {
-            name: op.name.get_ref().clone(),
-            table,
-        });
+        order.push(m);
     }
-    let operations: Vec<Operation> = operations
-        .into_iter()
-        .enumerate()
-        .map(|(code, op)| {
-            op.ok_or_else(|| ctx.err(
-                raw.clb.operation.select.span(),
-                format!("clb.operation: no operation defined for code {}", code),
-            ))
-        })
-        .collect::<Result<_, _>>()?;
-    let carry_table = parse_table(&ctx, &raw.clb.operation.carry_table, table_len, "clb.operation.carry_table")?;
+    if order.len() != input_muxes.len() {
+        return Err(ctx.err(
+            raw_lut.index.span(),
+            format!("clb.lut.index must list every input mux ({} of them)", input_muxes.len()),
+        ));
+    }
+    let mut presets = Vec::new();
+    for p in &raw_lut.presets {
+        let value = *p.value.get_ref();
+        if table_len < 64 && value >> table_len != 0 {
+            return Err(ctx.err(
+                p.value.span(),
+                format!("clb.lut.presets: \"{}\" = {:#x} does not fit in {} bits", p.name.get_ref(), value, table_len),
+            ));
+        }
+        presets.push((p.name.get_ref().clone(), value));
+    }
+    let lut = LutSpec { field: lut_field, order, presets };
+    let carry_table = parse_table(&ctx, &raw_lut.carry_table, table_len, "clb.lut.carry_table")?;
 
     // Carry chain.
     let carry = CarrySpec {
@@ -683,51 +775,144 @@ fn build(src: &str, raw: RawFile) -> Result<Fabric, FabricError> {
         couple_field,
     };
 
-    // IO maps.
-    let io_inputs = io_grid(&ctx, &raw.io.inputs, rows, horz_lanes, "io.inputs")?;
-    for row in &io_inputs {
-        for name in row {
+    // IO controller.
+    let io_fields = build_fields(&ctx, "io", &raw.io.fields)?;
+    let mut all_pads: Vec<String> = Vec::new();
+    let mut pad_list = |list: &Spanned<Vec<Spanned<String>>>, what: &str| -> Result<Vec<String>, FabricError> {
+        let mut out = Vec::new();
+        for tok in list.get_ref() {
+            let name = tok.get_ref();
             if name.is_empty() {
-                return Err(ctx.err(
-                    raw.io.inputs.span(),
-                    "io.inputs: empty names are not allowed (every lane is driven at the left edge)".to_string(),
-                ));
+                return Err(ctx.err(tok.span(), format!("{}: empty pad name", what)));
             }
+            if all_pads.contains(name) {
+                return Err(ctx.err(tok.span(), format!("{}: pad \"{}\" is declared twice", what, name)));
+            }
+            all_pads.push(name.clone());
+            out.push(name.clone());
+        }
+        Ok(out)
+    };
+    let mut io_inputs = pad_list(&raw.io.inputs, "io.inputs")?;
+    let mut io_outputs = pad_list(&raw.io.outputs, "io.outputs")?;
+    // DDIO pads join the lists: fabric-side inputs after the chip inputs, and
+    // outs then dirs after the chip outputs.
+    let mut ddio_names = Vec::new();
+    for d in &raw.io.ddio {
+        for tok in [&d.input, &d.out, &d.dir] {
+            if all_pads.contains(tok.get_ref()) {
+                return Err(ctx.err(tok.span(), format!("io.ddio: pad \"{}\" is declared twice", tok.get_ref())));
+            }
+            all_pads.push(tok.get_ref().clone());
+        }
+        ddio_names.push((d.input.get_ref().clone(), d.out.get_ref().clone(), d.dir.get_ref().clone()));
+    }
+    let mut ddio = Vec::new();
+    for (i, _, _) in &ddio_names {
+        io_inputs.push(i.clone());
+    }
+    for (_, o, _) in &ddio_names {
+        io_outputs.push(o.clone());
+    }
+    for (_, _, d) in &ddio_names {
+        io_outputs.push(d.clone());
+    }
+    for (i, o, d) in &ddio_names {
+        ddio.push(Ddio {
+            input: io_inputs.iter().position(|n| n == i).expect("just pushed"),
+            output: io_outputs.iter().position(|n| n == o).expect("just pushed"),
+            dir: io_outputs.iter().position(|n| n == d).expect("just pushed"),
+        });
+    }
+    let io_source = |tok: &Spanned<String>, what: &str| -> Result<IoSource, FabricError> {
+        let name = tok.get_ref();
+        if let Some(i) = io_inputs.iter().position(|n| n == name) {
+            return Ok(IoSource::InPad(i));
+        }
+        if let Some(o) = io_outputs.iter().position(|n| n == name) {
+            return Ok(IoSource::OutPad(o));
+        }
+        Err(ctx.err(tok.span(), format!("{}: \"{}\" is not a declared pad", what, name)))
+    };
+    let mut io_mux_sources = Vec::new();
+    for tok in raw.io.input_mux_sources.get_ref() {
+        io_mux_sources.push(io_source(tok, "io.input_mux_sources")?);
+    }
+    let raw_left = raw.io.left.get_ref();
+    if raw_left.len() != rows {
+        return Err(ctx.err(
+            raw.io.left.span(),
+            format!("io.left: {} rows required (fabric.rows = {}), found {}", rows, rows, raw_left.len()),
+        ));
+    }
+    let mut io_left = Vec::new();
+    for (r, row) in raw_left.iter().enumerate() {
+        if row.len() != horz_lanes {
+            return Err(ctx.err(
+                raw.io.left.span(),
+                format!("io.left: row {} has {} lanes, expected {} (buses.horizontal)", r, row.len(), horz_lanes),
+            ));
+        }
+        let mut lanes = Vec::new();
+        for tok in row {
+            lanes.push(match tok.get_ref().strip_prefix("sel:") {
+                Some(field) => {
+                    let sel = parse_select(&ctx, &io_fields, &Spanned::new(tok.span(), field.to_string()), "io.left")?;
+                    if (1usize << sel.width) != io_mux_sources.len() {
+                        return Err(ctx.err(
+                            tok.span(),
+                            format!(
+                                "io.left: a {}-bit select cannot address the {} input mux sources",
+                                sel.width,
+                                io_mux_sources.len()
+                            ),
+                        ));
+                    }
+                    LeftLane::Mux(sel)
+                }
+                None => LeftLane::Fixed(io_source(tok, "io.left")?),
+            });
+        }
+        io_left.push(lanes);
+    }
+    let raw_drive = raw.io.drive.get_ref();
+    for (pad, tok) in raw_drive {
+        if !io_outputs.contains(pad) {
+            return Err(ctx.err(tok.span(), format!("io.drive: \"{}\" is not an output-side pad", pad)));
         }
     }
-    let io_outputs: Vec<Vec<Option<String>>> = io_grid(&ctx, &raw.io.outputs, rows, horz_lanes, "io.outputs")?
-        .into_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|name| if name.is_empty() { None } else { Some(name) })
-                .collect()
-        })
-        .collect();
-
-    let mut ddio = Vec::new();
-    for d in &raw.io.ddio {
-        let input = d.input.get_ref().clone();
-        if !io_inputs.iter().flatten().any(|n| *n == input) {
-            return Err(ctx.err(
-                d.input.span(),
-                format!("io.ddio: \"{}\" does not appear in io.inputs", input),
-            ));
-        }
-        let output = d.out.get_ref().clone();
-        if !io_outputs.iter().flatten().flatten().any(|n| *n == output) {
-            return Err(ctx.err(
-                d.out.span(),
-                format!("io.ddio: \"{}\" does not appear in io.outputs", output),
-            ));
-        }
-        let dir = d.dir.get_ref().clone();
-        if !io_outputs.iter().flatten().flatten().any(|n| *n == dir) {
-            return Err(ctx.err(
-                d.dir.span(),
-                format!("io.ddio: \"{}\" does not appear in io.outputs", dir),
-            ));
-        }
-        ddio.push(Ddio { input, output, dir });
+    let mut io_drive = Vec::new();
+    for pad in &io_outputs {
+        let tok = raw_drive.get(pad).ok_or_else(|| {
+            ctx.err(raw.io.drive.span(), format!("io.drive: nothing drives output-side pad \"{}\"", pad))
+        })?;
+        let text = tok.get_ref();
+        io_drive.push(if let Some(field) = text.strip_prefix("sel:") {
+            let sel = parse_select(&ctx, &io_fields, &Spanned::new(tok.span(), field.to_string()), "io.drive")?;
+            if (1usize << sel.width) != rows * horz_lanes {
+                return Err(ctx.err(
+                    tok.span(),
+                    format!("io.drive: a {}-bit select cannot address the {} right-edge lanes", sel.width, rows * horz_lanes),
+                ));
+            }
+            PadDrive::Mux(sel)
+        } else {
+            let mut parts = text.strip_prefix("lane:").unwrap_or("").split(':');
+            let (Some(Ok(row)), Some(Ok(lane)), None) = (
+                parts.next().map(str::parse::<usize>),
+                parts.next().map(str::parse::<usize>),
+                parts.next(),
+            ) else {
+                return Err(ctx.err(
+                    tok.span(),
+                    format!("io.drive: \"{}\" must be \"sel:<field>\" or \"lane:R:L\"", text),
+                ));
+            };
+            if row >= rows || lane >= horz_lanes {
+                return Err(ctx.err(tok.span(), format!("io.drive: lane {}:{} is outside the fabric", row, lane)));
+            }
+            PadDrive::Fixed { row, lane }
+        });
     }
 
     // Bitstream chain: each cell group exactly once.
@@ -735,28 +920,32 @@ fn build(src: &str, raw: RawFile) -> Result<Fabric, FabricError> {
     for g in raw.bitstream.chain.get_ref() {
         let cells = match g.cells.get_ref().as_str() {
             "clb" => ChainCells::Clb,
+            "io" => ChainCells::Io,
             "csb" => ChainCells::Csb,
             other => {
                 return Err(ctx.err(
                     g.cells.span(),
-                    format!("bitstream.chain: unknown cell group \"{}\" (expected \"clb\" or \"csb\")", other),
+                    format!("bitstream.chain: unknown cell group \"{}\" (expected \"clb\", \"io\" or \"csb\")", other),
                 ))
             }
         };
         let order = match (cells, g.order.get_ref().as_str()) {
             (ChainCells::Clb, "row_major") => ChainOrder::RowMajor,
+            (ChainCells::Io, "single") => ChainOrder::Single,
             (ChainCells::Csb, "column_ascending") => ChainOrder::ColumnAscending,
-            (ChainCells::Clb, other) => {
+            (_, other) => {
+                let want = match cells {
+                    ChainCells::Clb => "row_major",
+                    ChainCells::Io => "single",
+                    ChainCells::Csb => "column_ascending",
+                };
                 return Err(ctx.err(
                     g.order.span(),
-                    format!("bitstream.chain: unknown clb order \"{}\" (expected \"row_major\")", other),
-                ))
-            }
-            (ChainCells::Csb, other) => {
-                return Err(ctx.err(
-                    g.order.span(),
-                    format!("bitstream.chain: unknown csb order \"{}\" (expected \"column_ascending\")", other),
-                ))
+                    format!(
+                        "bitstream.chain: unknown {} order \"{}\" (expected \"{}\")",
+                        g.cells.get_ref(), other, want
+                    ),
+                ));
             }
         };
         if chain.iter().any(|c: &ChainGroup| c.cells == cells) {
@@ -767,7 +956,7 @@ fn build(src: &str, raw: RawFile) -> Result<Fabric, FabricError> {
         }
         chain.push(ChainGroup { cells, order });
     }
-    for (cells, label) in [(ChainCells::Clb, "clb"), (ChainCells::Csb, "csb")] {
+    for (cells, label) in [(ChainCells::Clb, "clb"), (ChainCells::Io, "io"), (ChainCells::Csb, "csb")] {
         if !chain.iter().any(|c| c.cells == cells) {
             return Err(ctx.err(
                 raw.bitstream.chain.span(),
@@ -775,6 +964,16 @@ fn build(src: &str, raw: RawFile) -> Result<Fabric, FabricError> {
             ));
         }
     }
+    let start_bit = match &raw.bitstream.start_bit {
+        None => None,
+        Some(b) => match b.get_ref() {
+            0 => Some(false),
+            1 => Some(true),
+            other => {
+                return Err(ctx.err(b.span(), format!("bitstream.start_bit must be 0 or 1, found {}", other)))
+            }
+        },
+    };
 
     // Naming templates.
     for (tpl, what, need_row) in [
@@ -799,21 +998,26 @@ fn build(src: &str, raw: RawFile) -> Result<Fabric, FabricError> {
         vertical_ring: raw.buses.vertical_ring,
         clb_fields,
         input_muxes,
-        op_select,
-        operations,
+        lut,
         carry_table,
         carry,
         ff,
         output_muxes,
         csb_fields,
         csb_clock,
+        io_fields,
         io_inputs,
         io_outputs,
         ddio,
+        io_mux_sources,
+        io_left,
+        io_drive,
         chain,
+        start_bit,
         naming: Naming {
             clb: raw.naming.clb.into_inner(),
             csb: raw.naming.csb.into_inner(),
+            io: raw.naming.io,
             suffix_op: raw.naming.suffix_op,
             suffix_reg: raw.naming.suffix_reg,
             suffix_carry: raw.naming.suffix_carry,
@@ -1028,29 +1232,4 @@ fn parse_table(
             )),
         })
         .collect()
-}
-
-fn io_grid(
-    ctx: &Ctx,
-    grid: &Spanned<Vec<Vec<String>>>,
-    rows: usize,
-    lanes: usize,
-    what: &str,
-) -> Result<Vec<Vec<String>>, FabricError> {
-    let raw = grid.get_ref();
-    if raw.len() != rows {
-        return Err(ctx.err(
-            grid.span(),
-            format!("{}: {} rows required (fabric.rows = {}), found {}", what, rows, rows, raw.len()),
-        ));
-    }
-    for (i, row) in raw.iter().enumerate() {
-        if row.len() != lanes {
-            return Err(ctx.err(
-                grid.span(),
-                format!("{}: row {} has {} lanes, expected {} (buses.horizontal)", what, i, row.len(), lanes),
-            ));
-        }
-    }
-    Ok(raw.clone())
 }

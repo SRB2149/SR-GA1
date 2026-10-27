@@ -1,6 +1,6 @@
 //! The cell library is derived, not written down, so these tests check the
 //! derivation against what the fabric actually does: every implementation is
-//! re-simulated through the operation truth tables it came from.
+//! re-simulated through the LUT value it carries, in the fabric's index order.
 
 use sr_ga1_synth::fabric::Fabric;
 use sr_ga1_synth::genlib::{CellLibrary, PhysIn};
@@ -11,47 +11,30 @@ fn fabric() -> Fabric {
     Fabric::load_file(&path).expect("the repository fabric.toml must load")
 }
 
-/// Run an implementation through the fabric's own operation table and check
-/// it computes the cell's function for every input combination.
+/// Run an implementation through its LUT value and check it computes the
+/// cell's function for every input combination, whatever the don't-care
+/// inputs carry.
 fn implementations_are_faithful(f: &Fabric, lib: &CellLibrary) {
     for cell in &lib.cells {
         for imp in &cell.impls {
-            let op = f
-                .operations
-                .iter()
-                .find(|o| o.code == imp.op_code)
-                .unwrap_or_else(|| panic!("{} uses operation code {}", cell.name, imp.op_code));
-            // A don't-care physical input must genuinely not matter, so try
-            // it both ways.
-            let dont_cares: Vec<usize> = imp
-                .inputs
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| **p == PhysIn::DontCare)
-                .map(|(i, _)| i)
-                .collect();
-            for fill in 0..1usize << dont_cares.len() {
-                for minterm in 0..1usize << cell.arity {
-                    let mut index = 0usize;
-                    for (i, phys) in imp.inputs.iter().enumerate() {
-                        let value = match phys {
-                            PhysIn::Pin(k) => minterm >> k & 1 != 0,
-                            PhysIn::Const(v) => *v,
-                            PhysIn::DontCare => {
-                                let slot = dont_cares.iter().position(|&d| d == i).unwrap_or(0);
-                                fill >> slot & 1 != 0
-                            }
-                        };
-                        if value {
-                            index |= 1 << i;
+            for physical in 0..1usize << lib.phys_inputs {
+                let values: Vec<bool> = (0..lib.phys_inputs).map(|i| physical >> i & 1 != 0).collect();
+                let mut minterm = 0usize;
+                for (i, phys) in imp.inputs.iter().enumerate() {
+                    if let PhysIn::Pin(k) = phys {
+                        if values[i] {
+                            minterm |= 1 << k;
                         }
                     }
-                    assert_eq!(
-                        op.table[index], cell.table[minterm],
-                        "{} via {} disagrees with the fabric at minterm {}",
-                        cell.name, imp.op_name, minterm
-                    );
                 }
+                assert_eq!(
+                    f.eval_lut(imp.lut, &values),
+                    cell.table[minterm],
+                    "{} via LUT 0x{:02X} disagrees with its function at inputs {:?}",
+                    cell.name,
+                    imp.lut,
+                    values
+                );
             }
         }
     }
@@ -101,123 +84,56 @@ fn cell_names_describe_the_function_they_name() {
     }
 }
 
+
+/// Every pin placement exists, so a pin can always be moved to whichever input
+/// can see the lane its signal arrives on.
 #[test]
-fn degraded_cells_prefer_the_cheap_inputs() {
+fn every_pin_placement_is_available() {
     let f = fabric();
     let lib = CellLibrary::derive(&f);
-    // Physical input order is a, b, c; a sees only the minor lanes, which
-    // carry no constant outside row 3, so it must never be the first choice.
-    for name in ["AND2", "OR2", "NAND2", "NOR2", "XOR2", "XNOR2", "INV", "BUF"] {
-        let cell = lib.cell(name).expect("cell present");
-        let first = cell.impls.first().expect("at least one implementation");
-        assert!(
-            !matches!(first.inputs[0], PhysIn::Const(_)),
-            "{} would tie input a, which is expensive outside row 3: {:?}",
-            name,
-            first
-        );
+    for cell in &lib.cells {
+        let expected = match cell.arity {
+            1 => 3,
+            2 => 6,
+            _ => 6,
+        };
+        assert_eq!(cell.impls.len(), expected, "{} has {} placements", cell.name, cell.impls.len());
+        for imp in &cell.impls {
+            let pins = imp.inputs.iter().filter(|p| matches!(p, PhysIn::Pin(_))).count();
+            assert_eq!(pins, cell.arity, "{}: one physical input per pin, none shared", cell.name);
+        }
     }
+    // Every 3-input function that uses all three inputs, plus the 2- and
+    // 1-input ones that use all of theirs.
+    assert_eq!(lib.cells.iter().filter(|c| c.arity == 3).count(), 218);
+    assert_eq!(lib.cells.iter().filter(|c| c.arity == 2).count(), 10);
+    assert_eq!(lib.cells.iter().filter(|c| c.arity == 1).count(), 2);
 }
 
 #[test]
-fn an_unroutable_constant_has_somewhere_to_fall_back_to() {
+fn a_buffer_can_take_its_signal_on_any_input() {
     let f = fabric();
     let lib = CellLibrary::derive(&f);
-    // Phase 6 re-maps a cell when its constant proves unroutable, so the
-    // common degraded cells must offer more than one physical form.
-    for name in ["INV", "BUF", "AND2", "OR2"] {
-        let cell = lib.cell(name).expect("cell present");
-        assert!(
-            cell.impls.len() > 1,
-            "{} has only one implementation, so a re-map has nowhere to go",
-            name
-        );
+    let buf = lib.buffer().expect("BUF");
+    for input in 0..lib.phys_inputs {
+        let forms = buf.impls_for_input(input);
+        assert_eq!(forms.len(), 1, "one buffer per arrival input");
+        // It copies that input whatever the others carry.
+        for physical in 0..8usize {
+            let values: Vec<bool> = (0..3).map(|i| physical >> i & 1 != 0).collect();
+            assert_eq!(f.eval_lut(forms[0].lut, &values), values[input]);
+        }
     }
+    // With a as the most significant LUT index bit, BUF on a is the BUF_A preset.
+    assert_eq!(buf.impls_for_input(0)[0].lut, 0xF0);
 }
 
-/// Constants are counted by the lanes they need, not the inputs they tie.
-/// Input `b` sees {h1, h2} and input `c` sees {h2, h3, v0, carry}, so tying
-/// both to 0 costs the single lane h2 — the same as tying one of them.
 #[test]
-fn tying_two_inputs_to_one_lane_costs_no_more_than_tying_one() {
+fn the_adder_sum_is_the_fabrics_xor3_preset() {
     let f = fabric();
     let lib = CellLibrary::derive(&f);
-    let buf = lib.cell("BUF").expect("BUF");
-
-    let position = |op: &str, inputs: &[PhysIn]| {
-        buf.impls
-            .iter()
-            .position(|i| i.op_name == op && i.inputs == inputs)
-            .unwrap_or_else(|| panic!("{} {:?} is not an implementation of BUF", op, inputs))
-    };
-    // OR3(a, 0, 0) ties b and c, but both read the one constant lane.
-    let or3 = position("OR3", &[PhysIn::Pin(0), PhysIn::Const(false), PhysIn::Const(false)]);
-    // AO21(-, 0, a) ties only b.
-    let ao21 = position("AO21", &[PhysIn::DontCare, PhysIn::Const(false), PhysIn::Pin(0)]);
-    assert!(
-        or3 < ao21,
-        "OR3(a,0,0) needs one constant lane and keeps the signal on a minor lane, so it \
-         should not rank below a form that moves the signal onto a major lane"
-    );
-
-    // Anything tying input a must rank last: no upstream CLB can put a
-    // constant on a minor lane.
-    let ties_a = |i: &&sr_ga1_synth::genlib::CellImpl| matches!(i.inputs[0], PhysIn::Const(_));
-    let first_a = buf.impls.iter().position(|i| ties_a(&i)).expect("some form ties a");
-    assert!(
-        first_a > or3 && first_a > ao21,
-        "forms tying input a must rank below every form that does not"
-    );
-}
-
-#[test]
-fn the_shared_constant_lane_is_one_a_major_mux_can_drive() {
-    let f = fabric();
-    // The lane that serves both b and c must be one whose driving mux can
-    // produce constants, or the saving is imaginary.
-    let const_lanes = f.const_capable_horz_lanes();
-    let b = f.input_mux("b").expect("input b");
-    let c = f.input_mux("c").expect("input c");
-    let shared: Vec<usize> = const_lanes
-        .iter()
-        .copied()
-        .filter(|lane| {
-            let sees = |m: &sr_ga1_synth::fabric::InputMux| {
-                m.sources.contains(&sr_ga1_synth::fabric::Source::HorzIn(*lane))
-            };
-            sees(b) && sees(c)
-        })
-        .collect();
-    assert_eq!(shared, vec![2], "b and c overlap on exactly one constant-capable lane");
-}
-
-#[test]
-fn buffer_forms_can_be_selected_by_arrival_lane() {
-    let f = fabric();
-    let lib = CellLibrary::derive(&f);
-    let buf = lib.cell("BUF").expect("BUF");
-
-    // A chip input entering on a minor lane can only reach input a, so the
-    // router needs at least one form whose live pin sits there.
-    let on_a = buf.impls_for_input(0);
-    assert!(!on_a.is_empty(), "no buffer accepts its signal on input a");
-    assert!(on_a.iter().all(|i| i.takes_pin_on(0)));
-    assert!(
-        on_a.iter().any(|i| i.op_name == "OR3" && i.inputs[1] == PhysIn::Const(false)),
-        "OR3(a, 0, 0) should be available for a signal arriving on a minor lane"
-    );
-
-    // And a signal arriving on a major lane or the vertical bus reaches c.
-    let on_c = buf.impls_for_input(2);
-    assert!(!on_c.is_empty(), "no buffer accepts its signal on input c");
-    assert!(on_c.iter().all(|i| i.takes_pin_on(2)));
-
-    // The filter must preserve the cheapest-first order of `impls`.
-    let indices: Vec<usize> = on_a
-        .iter()
-        .map(|sel| buf.impls.iter().position(|i| i == *sel).expect("selected form is a member"))
-        .collect();
-    assert!(indices.windows(2).all(|w| w[0] < w[1]), "selection must stay cheapest-first");
+    let xor3 = lib.cell("XOR3").expect("XOR3");
+    assert!(xor3.impls.iter().all(|i| i.lut == 0x96), "XOR3 is symmetric, so every placement is 0x96");
 }
 
 #[test]

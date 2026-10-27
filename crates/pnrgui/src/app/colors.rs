@@ -4,6 +4,28 @@
 
 use eframe::egui::Color32;
 
+/// Routing and blocks a configuration uses, in the utilisation overlay.
+pub const UTIL_USED: Color32 = Color32::from_rgb(255, 170, 40);
+/// Resources it leaves free, drawn faintly so the used ones stand out.
+pub const UTIL_FREE: Color32 = Color32::from_rgb(58, 58, 64);
+
+/// A swatch for a fraction of capacity: dark when idle, through amber, to red
+/// when full.
+pub fn heat(fraction: f32) -> Color32 {
+    let f = fraction.clamp(0.0, 1.0);
+    if f == 0.0 {
+        return Color32::from_gray(48);
+    }
+    let lerp = |a: u8, b: u8, t: f32| (a as f32 + (b as f32 - a as f32) * t) as u8;
+    if f < 0.5 {
+        let t = f / 0.5;
+        Color32::from_rgb(lerp(40, 200, t), lerp(110, 150, t), lerp(60, 30, t))
+    } else {
+        let t = (f - 0.5) / 0.5;
+        Color32::from_rgb(lerp(200, 210, t), lerp(150, 50, t), lerp(30, 40, t))
+    }
+}
+
 /// Split `data[3]` into ("data", Some(3)); plain names have no index.
 pub fn bus_parts(name: &str) -> (&str, Option<usize>) {
     if let Some(open) = name.rfind('[') {

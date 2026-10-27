@@ -1,7 +1,8 @@
 //! Can a register's output ever reach an input of a cell that could recompute
 //! it? Sequential logic with state needs Q -> next-state logic -> D, and on
-//! this fabric D is hard-wired to the cell's own operation result, so the
-//! question is whether `_reg` can get back to the inputs of its own CLB.
+//! this fabric D is hard-wired to the cell's own LUT result, so the question
+//! is whether `_reg` can get back to the inputs of its own CLB — inside the
+//! fabric alone, and with the IO controller reading chip outputs back.
 //!
 //! This walks the real routing graph rather than reasoning about the tables by
 //! hand.
@@ -17,7 +18,7 @@ fn main() {
 
     // Reachability ignoring capacity: if a path does not exist here, no
     // placement or routing effort can invent one.
-    let reachable = |start: Node| -> Vec<Node> {
+    let reachable = |start: Node, through_io: bool| -> Vec<Node> {
         let Some(start) = graph.id(start) else { return Vec::new() };
         let mut seen = vec![false; graph.len()];
         let mut queue = VecDeque::new();
@@ -29,6 +30,9 @@ fn main() {
                 // The flip-flop is the boundary we are asking about, so do not
                 // cross another one.
                 if edge.kind == EdgeKind::Register {
+                    continue;
+                }
+                if !through_io && edge.kind == EdgeKind::OnChipLoop {
                     continue;
                 }
                 if !seen[edge.to] {
@@ -44,34 +48,24 @@ fn main() {
     println!("fabric {} ({}x{})", fabric.name, fabric.columns, fabric.rows);
     println!();
 
-    let mut any_self = false;
-    let mut any_cell = false;
-    for col in 0..fabric.columns {
-        for row in 0..fabric.rows {
-            let from = reachable(Node::Reg { col, row });
-            let own: Vec<&Node> = from
-                .iter()
-                .filter(|n| matches!(n, Node::In { col: c, row: r, .. } if *c == col && *r == row))
-                .collect();
-            if !own.is_empty() {
-                any_self = true;
-                println!("CLB({}, {})._reg reaches its own inputs: {:?}", col, row, own);
-            }
-            if from.iter().any(|n| matches!(n, Node::In { .. })) {
-                any_cell = true;
+    for (through_io, label) in [(false, "inside the fabric"), (true, "with the IO controller's on-chip loops")] {
+        let mut cells = 0;
+        for col in 0..fabric.columns {
+            for row in 0..fabric.rows {
+                let own = reachable(Node::Reg { col, row }, through_io)
+                    .iter()
+                    .any(|n| matches!(n, Node::In { col: c, row: r, .. } if *c == col && *r == row));
+                if own {
+                    cells += 1;
+                }
             }
         }
-    }
-
-    if !any_self {
-        println!("NO register output reaches any input of its own CLB.");
-        println!();
-        println!("Consequence: the flip-flop's data input is its own cell's operation result,");
-        println!("so a register whose next value depends on its current value cannot be built.");
-        println!("That rules out counters, accumulators and LFSRs.");
-    }
-    if !any_cell {
-        println!("NO register output reaches any operation input anywhere on the fabric.");
+        println!(
+            "{}: {} of {} registers can reach an input of their own CLB",
+            label,
+            cells,
+            fabric.columns * fabric.rows
+        );
     }
 
     // Which vertical lanes each output can occupy, and which the logic reads.

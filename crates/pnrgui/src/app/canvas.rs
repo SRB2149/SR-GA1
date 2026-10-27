@@ -15,7 +15,14 @@ const GAP_X: f32 = 96.0;
 const GAP_Y: f32 = 64.0;
 const IO_W: f32 = 84.0;
 const CSB_H: f32 = 44.0;
-const CSB_GAP: f32 = 72.0;
+const CSB_GAP: f32 = 112.0;
+/// Where the vertical lanes stop below row 0: the selected lane alone carries
+/// on down to the tap channel, so the tap never crosses the other lanes.
+const STUB_ABOVE_CSB: f32 = 46.0;
+/// The horizontal run from the selected ring lane to its CSB.
+const TAP_ABOVE_CSB: f32 = 18.0;
+/// The clock's run from the CSB's top corner out to the column's clock line.
+const CLOCK_EXIT_ABOVE_CSB: f32 = 8.0;
 const MARGIN: f32 = 40.0;
 
 fn col_x(c: usize) -> f32 {
@@ -43,6 +50,10 @@ fn clk_x(x0: f32) -> f32 {
 
 fn csb_y(fabric: &Fabric) -> f32 {
     row_y(fabric, 0) + TILE_H + CSB_GAP
+}
+
+fn stub_end_y(fabric: &Fabric) -> f32 {
+    csb_y(fabric) - STUB_ABOVE_CSB
 }
 
 fn right_io_x(fabric: &Fabric) -> f32 {
@@ -83,6 +94,8 @@ pub fn block_rect(fabric: &Fabric, b: BlockId) -> Rect {
             Pos2::new(col_x(col) + TILE_W * 0.12, csb_y(fabric)),
             Vec2::new(TILE_W * 0.76, CSB_H),
         ),
+        // The controller spans both edges; its input tiles stand for it.
+        BlockId::Io => io_rect(fabric, true, fabric.rows - 1).union(io_rect(fabric, true, 0)),
     }
 }
 
@@ -91,13 +104,59 @@ fn io_rect(fabric: &Fabric, input_side: bool, row: usize) -> Rect {
     Rect::from_min_size(Pos2::new(x, row_y(fabric, row)), Vec2::new(IO_W, TILE_H))
 }
 
+/// One wire from the right edge back to the left, as drawn.
+struct LoopWire {
+    /// Right-edge (row, lane) it leaves from.
+    from: (usize, usize),
+    /// Left-edge (row, lane) it enters on.
+    to: (usize, usize),
+    on_chip: bool,
+    label: String,
+}
+
+/// Every loop to draw: each left-edge lane the IO controller feeds from an
+/// output, then each board wire into a pin some lane reads.
+fn loop_wires(app: &App) -> Vec<LoopWire> {
+    let fabric = &app.fabric;
+    let design = &app.file.design;
+    let mut wires = Vec::new();
+    for row in 0..fabric.rows {
+        for lane in 0..fabric.horz_lanes {
+            if let fpga_core::fabric::IoSource::OutPad(o) = design.left_source(fabric, row, lane) {
+                wires.push(LoopWire {
+                    from: design.pad_lane(fabric, o),
+                    to: (row, lane),
+                    on_chip: true,
+                    label: format!("on-chip: {} → row {} lane {}", app.pad_display_name(&fabric.io_outputs[o]), row, lane),
+                });
+            }
+        }
+    }
+    for link in design.loopback() {
+        if link.from.input_side || !link.to.input_side {
+            continue;
+        }
+        let from_name = design.effective_io_name(fabric, link.from).unwrap_or_default();
+        let to_name = design.effective_io_name(fabric, link.to).unwrap_or_default();
+        for to in design.lanes_reading(fabric, fpga_core::fabric::IoSource::InPad(link.to.index)) {
+            wires.push(LoopWire {
+                from: design.pad_lane(fabric, link.from.index),
+                to,
+                on_chip: false,
+                label: format!("board: {} → {}", from_name, to_name),
+            });
+        }
+    }
+    wires
+}
+
 pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
     let avail = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(avail, Sense::click_and_drag());
     let painter = ui.painter_at(avail);
     painter.rect_filled(avail, 0.0, Color32::from_gray(24));
 
-    let world = world_rect_with(&app.fabric, app.file.design.loopback().len());
+    let world = world_rect_with(&app.fabric, loop_wires(app).len());
     if app.fit_requested {
         app.fit_requested = false;
         let zoom = (avail.width() / world.width()).min(avail.height() / world.height()) * 0.96;
@@ -127,7 +186,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
 
     let zoom = app.cam.zoom;
     let to_screen = |p: Pos2| -> Pos2 { avail.min + app.cam.pan + p.to_vec2() * zoom };
-    let seg_labels = zoom > 0.42;
+    let detail = zoom > 0.42;
+    let seg_labels = detail && app.show_net_names;
+    let overlay = app.show_util_overlay;
     let lane_font = FontId::proportional((11.0 * zoom).clamp(8.0, 15.0));
     let block_font = FontId::proportional((14.0 * zoom).clamp(9.0, 20.0));
     let small_font = FontId::proportional((10.5 * zoom).clamp(8.0, 14.0));
@@ -215,14 +276,20 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
                 } else {
                     app.nets.horz_edge(row, lane)
                 };
-                let (color, name, dim) = wire_color(app, origin);
-                let value = settled.map(|s| {
+                let (mut color, name, mut dim) = wire_color(app, origin);
+                let mut value = settled.map(|s| {
                     if pos < app.fabric.columns {
                         s.horz_in(pos, row, lane)
                     } else {
                         s.horz_edge(row, lane)
                     }
                 });
+                if overlay {
+                    let used = app.util.horz(row, lane, pos);
+                    color = if used { colors::UTIL_USED } else { colors::UTIL_FREE };
+                    dim = !used;
+                    value = None;
+                }
                 draw_wire(&painter, Pos2::new(x_from, y), Pos2::new(x_to, y), color, value, dim);
                 if seg_labels {
                     painter.text(
@@ -245,11 +312,18 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
             let x = vlane_x(&app.fabric, x0, lane);
             for pos in 0..app.fabric.rows {
                 let origin = app.nets.vert_in(col, pos, lane);
-                let (color, name, dim) = wire_color(app, origin);
-                let value = settled.map(|s| s.vert_in(col, pos, lane));
+                let (mut color, name, mut dim) = wire_color(app, origin);
+                let mut value = settled.map(|s| s.vert_in(col, pos, lane));
+                if overlay {
+                    let used = app.util.vert(col, lane, pos);
+                    color = if used { colors::UTIL_USED } else { colors::UTIL_FREE };
+                    dim = !used;
+                    value = None;
+                }
                 let (y_from, y_to) = if pos == 0 {
-                    // Ring tap: from the tap channel up into row 0.
-                    (csb_y(&app.fabric) - 14.0, row_y(&app.fabric, 0) + TILE_H)
+                    // The ring below row 0: it stops short of the CSB row,
+                    // and only the tapped lane continues down to its CSB.
+                    (stub_end_y(&app.fabric), row_y(&app.fabric, 0) + TILE_H)
                 } else {
                     (row_y(&app.fabric, pos - 1), row_y(&app.fabric, pos) + TILE_H)
                 };
@@ -268,7 +342,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
                 if pos == 0 && seg_labels {
                     let stagger = (lane as f32 - 1.5) * 12.0;
                     painter.text(
-                        to_screen(Pos2::new(x + 3.0, csb_y(&app.fabric) - 32.0 + stagger)),
+                        to_screen(Pos2::new(x + 3.0, (y_from + y_to) * 0.5 + stagger)),
                         Align2::LEFT_CENTER,
                         name,
                         small_font.clone(),
@@ -282,7 +356,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
                 [to_screen(Pos2::new(x, top)), to_screen(Pos2::new(x, top - 12.0))],
                 Stroke::new((1.2 * zoom).clamp(0.6, 2.0), colors::DIM),
             );
-            if seg_labels {
+            if detail {
                 painter.text(
                     to_screen(Pos2::new(x, top - 14.0)),
                     Align2::CENTER_BOTTOM,
@@ -348,7 +422,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
     }
 
     // ------------------------------------------------------------------
-    // Clock network: distinct dashed layer, CSB up the column, tap explicit.
+    // Clock network: distinct dashed layer. The CSB sources the column's
+    // clock: it leaves the CSB's top corner, runs up the column, and feeds
+    // every CLB's clock pin. The ring lane the CSB taps is drawn explicitly.
     for col in 0..app.fabric.columns {
         let x0 = col_x(col);
         let cx = clk_x(x0);
@@ -365,13 +441,36 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
         let dash = (6.0 * zoom).max(2.0);
         let gap = (4.0 * zoom).max(1.5);
         let top_feed = row_y(&app.fabric, app.fabric.rows - 1) + TILE_H - 12.0;
+        let exit_x = csb.max.x - 12.0;
+        let exit_y = csb.min.y - CLOCK_EXIT_ABOVE_CSB;
+        let arrow = |painter: &egui::Painter, tip: Pos2, dir: Vec2| {
+            if zoom > 0.35 {
+                let s = 3.5 * zoom;
+                let tip = to_screen(tip);
+                let back = -dir * s * 1.6;
+                let side = Vec2::new(-dir.y, dir.x) * s;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![tip, tip + back + side, tip + back - side],
+                    stroke.color,
+                    Stroke::NONE,
+                ));
+            }
+        };
+        // Out of the CSB's top corner, across to the column's clock line, and
+        // up the column.
         painter.extend(egui::Shape::dashed_line(
-            &[to_screen(Pos2::new(cx, csb.min.y)), to_screen(Pos2::new(cx, top_feed))],
+            &[
+                to_screen(Pos2::new(exit_x, csb.min.y)),
+                to_screen(Pos2::new(exit_x, exit_y)),
+                to_screen(Pos2::new(cx, exit_y)),
+                to_screen(Pos2::new(cx, top_feed)),
+            ],
             stroke,
             dash,
             gap,
         ));
-        // Feed into each CLB's clock pin (right edge, near the bottom).
+        // Feed each CLB's clock pin (right edge, near the bottom), with an
+        // arrow up the column below each feed and one into each pin.
         for row in 0..app.fabric.rows {
             let y = row_y(&app.fabric, row) + TILE_H - 12.0;
             painter.extend(egui::Shape::dashed_line(
@@ -380,23 +479,26 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
                 dash,
                 gap,
             ));
+            arrow(&painter, Pos2::new(cx, y + 18.0), Vec2::new(0.0, -1.0));
+            arrow(&painter, Pos2::new(x0 + TILE_W, y), Vec2::new(-1.0, 0.0));
         }
         // The CSB's input: either the explicit vertical-bus tap, or the chain.
         let coupled = app.file.design.csb(col).get(app.fabric.csb_clock.couple_field) != 0;
         if !coupled {
             let sel = app.file.design.csb(col).slice(&app.fabric.csb_clock.select) as usize;
             let lane = app.fabric.csb_clock.ring_lanes[sel];
-            let tap_y = csb_y(&app.fabric) - 14.0;
+            let stub_end = stub_end_y(&app.fabric);
+            let tap_y = csb_y(&app.fabric) - TAP_ABOVE_CSB;
             let lx = vlane_x(&app.fabric, x0, lane);
-            painter.line_segment(
-                [to_screen(Pos2::new(lx, tap_y)), to_screen(Pos2::new(csb.center().x, tap_y))],
-                Stroke::new((2.0 * zoom).clamp(1.0, 2.8), colors::CLOCK),
-            );
-            painter.line_segment(
-                [to_screen(Pos2::new(csb.center().x, tap_y)), to_screen(Pos2::new(csb.center().x, csb.min.y))],
-                Stroke::new((2.0 * zoom).clamp(1.0, 2.8), colors::CLOCK),
-            );
-            painter.circle_filled(to_screen(Pos2::new(lx, tap_y)), (3.0 * zoom).clamp(1.5, 4.0), colors::CLOCK);
+            let tap_stroke = Stroke::new((2.0 * zoom).clamp(1.0, 2.8), colors::CLOCK);
+            for (a, b) in [
+                (Pos2::new(lx, stub_end), Pos2::new(lx, tap_y)),
+                (Pos2::new(lx, tap_y), Pos2::new(csb.center().x, tap_y)),
+                (Pos2::new(csb.center().x, tap_y), Pos2::new(csb.center().x, csb.min.y)),
+            ] {
+                painter.line_segment([to_screen(a), to_screen(b)], tap_stroke);
+            }
+            painter.circle_filled(to_screen(Pos2::new(lx, stub_end)), (3.0 * zoom).clamp(1.5, 4.0), colors::CLOCK);
         }
         if seg_labels {
             painter.text(
@@ -441,31 +543,29 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
     }
 
     // ------------------------------------------------------------------
-    // Loop-around board wiring: a chip output tied back to a chip input.
+    // Loops from the right edge back to the left: on-chip through the IO
+    // controller (dashed), or board wiring from a chip output to a chip
+    // input (solid).
     //
     // Routed around the outside rather than across the grid, one lane per loop,
     // and drawn with the net's own identity colour and live value like any
     // other wire — it carries a real signal. The arrowhead at the input end is
     // the direction cue, matching the carry chain.
-    for (index, link) in app.file.design.loopback().iter().enumerate() {
-        let out_rect = io_rect(&app.fabric, false, link.from.row);
-        let in_rect = io_rect(&app.fabric, true, link.to.row);
-        let start = Pos2::new(
-            out_rect.max.x - 2.0,
-            lane_y(&app.fabric, out_rect.min.y, link.from.lane),
-        );
-        let end = Pos2::new(
-            in_rect.min.x - 2.0,
-            lane_y(&app.fabric, in_rect.min.y, link.to.lane),
-        );
+    for (index, wire) in loop_wires(app).into_iter().enumerate() {
+        let (from_row, from_lane) = wire.from;
+        let (to_row, to_lane) = wire.to;
+        let out_rect = io_rect(&app.fabric, false, from_row);
+        let in_rect = io_rect(&app.fabric, true, to_row);
+        let start = Pos2::new(out_rect.max.x - 2.0, lane_y(&app.fabric, out_rect.min.y, from_lane));
+        let end = Pos2::new(in_rect.min.x - 2.0, lane_y(&app.fabric, in_rect.min.y, to_lane));
         let y = loop_lane_y(&app.fabric, index);
         let out_x = start.x + 14.0 + index as f32 * 6.0;
         let in_x = end.x - 14.0 - index as f32 * 6.0;
 
         // The net is the one arriving at the driving output pad.
-        let origin = app.nets.horz_edge(link.from.row, link.from.lane);
+        let origin = app.nets.horz_edge(from_row, from_lane);
         let (color, _name, dim) = wire_color(app, origin);
-        let value = settled.map(|s| s.horz_edge(link.from.row, link.from.lane));
+        let value = settled.map(|s| s.horz_edge(from_row, from_lane));
 
         let pts = [
             start,
@@ -476,7 +576,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
             end,
         ];
         for w in pts.windows(2) {
-            draw_wire(&painter, w[0], w[1], color, value, dim);
+            if wire.on_chip && value.is_none() {
+                let w_px = (2.2 * zoom).clamp(1.0, 3.0);
+                painter.extend(egui::Shape::dashed_line(
+                    &[to_screen(w[0]), to_screen(w[1])],
+                    Stroke::new(w_px, color),
+                    (7.0 * zoom).max(2.0),
+                    (4.0 * zoom).max(1.5),
+                ));
+            } else {
+                draw_wire(&painter, w[0], w[1], color, value, dim);
+            }
         }
 
         // Arrowhead into the input pad.
@@ -494,20 +604,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
             ));
         }
         if seg_labels {
-            let from_name = app
-                .file
-                .design
-                .effective_io_name(&app.fabric, link.from)
-                .unwrap_or_default();
-            let to_name = app
-                .file
-                .design
-                .effective_io_name(&app.fabric, link.to)
-                .unwrap_or_default();
             painter.text(
                 to_screen(Pos2::new((out_x + in_x) * 0.5, y - 9.0)),
                 Align2::CENTER_CENTER,
-                format!("board: {} → {}", from_name, to_name),
+                wire.label,
                 small_font.clone(),
                 Color32::from_gray(150),
             );
@@ -529,7 +629,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
             let srect = Rect::from_min_max(to_screen(rect.min), to_screen(rect.max));
             let selected = app.selected == Some(b);
             let in_multi = app.multi.contains(&b);
-            painter.rect_filled(srect, 4.0, Color32::from_gray(40));
+            let fill = if overlay && app.util.block_counted(b, app.util_named_clbs) {
+                Color32::from_rgb(78, 62, 30)
+            } else {
+                Color32::from_gray(40)
+            };
+            painter.rect_filled(srect, 4.0, fill);
             let outline = if selected {
                 Stroke::new(2.5_f32, Color32::from_rgb(90, 170, 255))
             } else if in_multi {
@@ -542,12 +647,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
             let name_color = if app.is_pinned(b) { Color32::from_rgb(255, 220, 120) } else { Color32::from_gray(210) };
             painter.text(srect.center() - Vec2::new(0.0, 8.0 * zoom), Align2::CENTER_CENTER, name, block_font.clone(), name_color);
             if zoom > 0.3 {
-                let code = app.file.design.clb(col, row).slice(&app.fabric.op_select) as usize;
-                let op = &app.fabric.operations[code].name;
+                let lut = app.file.design.clb(col, row).get(app.fabric.lut.field);
+                let label = match app.fabric.preset_name(lut) {
+                    Some(name) => name.to_string(),
+                    None => format!("LUT 0x{:02X}", lut),
+                };
                 painter.text(
                     srect.center() + Vec2::new(0.0, 12.0 * zoom),
                     Align2::CENTER_CENTER,
-                    op,
+                    label,
                     small_font.clone(),
                     Color32::from_gray(140),
                 );
@@ -567,7 +675,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
         let rect = block_rect(&app.fabric, b);
         let srect = Rect::from_min_max(to_screen(rect.min), to_screen(rect.max));
         let selected = app.selected == Some(b);
-        painter.rect_filled(srect, 4.0, Color32::from_gray(36));
+        let fill = if overlay && app.util.block(b) {
+            Color32::from_rgb(78, 62, 30)
+        } else {
+            Color32::from_gray(36)
+        };
+        painter.rect_filled(srect, 4.0, fill);
         painter.rect_stroke(
             srect,
             4.0,
@@ -604,10 +717,25 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
             );
             if zoom > 0.35 {
                 for lane in 0..app.fabric.horz_lanes {
-                    let name = if input_side {
-                        app.fabric.io_inputs[row][lane].clone()
+                    // Inputs: the pin (or looped-back output) the lane reads,
+                    // blue where an input mux chose it. Outputs: every pin
+                    // reading the lane.
+                    let (name, color) = if input_side {
+                        let src = app.file.design.left_source(&app.fabric, row, lane);
+                        let name = app.pad_display_name(app.fabric.io_source_name(src));
+                        let muxed = matches!(app.fabric.io_left[row][lane], fpga_core::fabric::LeftLane::Mux(_));
+                        let color = if muxed { Color32::from_rgb(140, 190, 255) } else { Color32::from_gray(170) };
+                        (name, color)
                     } else {
-                        app.fabric.io_outputs[row][lane].clone().unwrap_or_else(|| "—".to_string())
+                        let names: Vec<String> = (0..app.fabric.io_outputs.len())
+                            .filter(|&o| app.file.design.pad_lane(&app.fabric, o) == (row, lane))
+                            .map(|o| app.pad_display_name(&app.fabric.io_outputs[o]))
+                            .collect();
+                        if names.is_empty() {
+                            ("—".to_string(), colors::DIM)
+                        } else {
+                            (names.join(","), Color32::from_gray(170))
+                        }
                     };
                     let y = lane_y(&app.fabric, rect.min.y, lane);
                     let (x, anchor) = if input_side {
@@ -615,7 +743,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, now: f64) {
                     } else {
                         (rect.min.x + 4.0, Align2::LEFT_CENTER)
                     };
-                    painter.text(to_screen(Pos2::new(x, y)), anchor, name, small_font.clone(), Color32::from_gray(170));
+                    painter.text(to_screen(Pos2::new(x, y)), anchor, name, small_font.clone(), color);
                 }
             }
         }

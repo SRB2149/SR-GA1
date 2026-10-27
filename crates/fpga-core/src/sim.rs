@@ -12,12 +12,17 @@
 //! No edges fire on tick 0: the previous-clock samples are seeded with the
 //! tick-0 resolved values. Registers start holding their configured reset
 //! values. A pass-through ring with no driver settles at 0. Combinational
-//! loops that cannot settle (only reachable through the DDIO direction
-//! feedback in this fabric) are detected and reported with the blocks
-//! involved, never hung on.
+//! loops that cannot settle (through the vertical rings, the IO controller's
+//! on-chip loops, DDIO read-back or board wiring) are detected and reported
+//! with the blocks involved, never hung on.
+//!
+//! The IO controller is evaluated inside the settle sweep: each output-side
+//! pad takes the right-edge lane its drive selects, each input-side pad is its
+//! stimulus (or board wire, or for a DDIO in output mode, its own output), and
+//! each left-edge lane takes the pad or output its input mux selects.
 
 use crate::config::{BlockId, Design, IoPad};
-use crate::fabric::{BusOut, CarryChain, Fabric, Source};
+use crate::fabric::{BusOut, CarryChain, Fabric, IoSource, Source};
 use std::collections::HashMap;
 
 /// Per-input stimulus patterns, keyed by the fabric's reserved input names.
@@ -85,6 +90,11 @@ pub struct Settled {
     carry: Vec<bool>,
     ff: Vec<bool>,
     carry_edge: bool,
+    /// Value per input-side pad, as the fabric sees it (indexed like
+    /// `Fabric::io_inputs`).
+    pads_in: Vec<bool>,
+    /// Value per output-side pad (indexed like `Fabric::io_outputs`).
+    pads_out: Vec<bool>,
     /// Resolved clock value per column.
     pub clocks: Vec<bool>,
 }
@@ -107,10 +117,29 @@ impl Settled {
         self.horz[self.hidx(row, lane, col)]
     }
 
-    /// Value on the segment entering the output controller (`row`, `lane`) —
-    /// i.e. the chip output mapped there.
+    /// Value on the segment leaving the fabric at the right edge (`row`,
+    /// `lane`), before the IO controller's output muxes.
     pub fn horz_edge(&self, row: usize, lane: usize) -> bool {
         self.horz[self.hidx(row, lane, self.columns)]
+    }
+
+    /// An input-side pad as the fabric sees it: for a DDIO in output mode, its
+    /// own output value.
+    pub fn pad_in(&self, pad: usize) -> bool {
+        self.pads_in[pad]
+    }
+
+    /// The value the IO controller drives onto an output-side pad.
+    pub fn pad_out(&self, pad: usize) -> bool {
+        self.pads_out[pad]
+    }
+
+    pub fn pad(&self, pad: IoPad) -> bool {
+        if pad.input_side {
+            self.pad_in(pad.index)
+        } else {
+            self.pad_out(pad.index)
+        }
     }
 
     pub fn vert_in(&self, col: usize, row: usize, lane: usize) -> bool {
@@ -226,19 +255,6 @@ fn enable_value(fabric: &Fabric, s: &Settled, col: usize, row: usize) -> bool {
     }
 }
 
-/// What drives one left-edge lane.
-enum LeftPin {
-    Const(bool),
-    /// A stimulus input, optionally gated off when the named DDIO direction
-    /// output (at the right edge) is 1.
-    Stim { name: String, gate: Option<(usize, usize)> },
-    /// A board wire from a chip output back to this input. Read from the same
-    /// right-edge slot the DDIO gate reads, and evaluated inside the settle
-    /// sweep, so the value propagates round exactly as the wire does and a loop
-    /// that will not settle is reported like any other combinational loop.
-    Loop { from: (usize, usize), gate: Option<(usize, usize)> },
-}
-
 fn settle(
     fabric: &Fabric,
     design: &Design,
@@ -260,40 +276,45 @@ fn settle(
         }
     }
 
-    // Left-edge drivers, with DDIO gating positions resolved to right-edge
-    // (row, lane) coordinates.
-    let dir_pos = |name: &str| {
-        fabric.io_outputs.iter().enumerate().find_map(|(row, lanes)| {
-            lanes
-                .iter()
-                .position(|n| n.as_deref() == Some(name))
-                .map(|lane| (row, lane))
+    // The IO controller's configuration, resolved once: the right-edge slot
+    // each output-side pad reads, and what each left-edge lane reads.
+    let pad_slot: Vec<usize> = (0..fabric.io_outputs.len())
+        .map(|o| {
+            let (r, l) = design.pad_lane(fabric, o);
+            hidx(r, l, columns)
         })
+        .collect();
+    let left: Vec<IoSource> = (0..rows)
+        .flat_map(|row| (0..hl).map(move |lane| (row, lane)))
+        .map(|(row, lane)| design.left_source(fabric, row, lane))
+        .collect();
+    // A board-wired input reads the output-side pad wired to it.
+    let wired: Vec<Option<usize>> = (0..fabric.io_inputs.len())
+        .map(|i| {
+            design
+                .loopback_driver(IoPad::input(i))
+                .filter(|from| !from.input_side)
+                .map(|from| from.index)
+        })
+        .collect();
+    let external: Vec<bool> = fabric
+        .io_inputs
+        .iter()
+        .map(|name| stimulus.value_at(name, tick))
+        .collect();
+    let pad_values = |h: &[bool]| -> (Vec<bool>, Vec<bool>) {
+        let outs: Vec<bool> = pad_slot.iter().map(|&i| h[i]).collect();
+        let ins = (0..fabric.io_inputs.len())
+            .map(|i| match fabric.ddio_of_input(i) {
+                Some(d) if outs[d.dir] => outs[d.output],
+                _ => match wired[i] {
+                    Some(o) => outs[o],
+                    None => external[i],
+                },
+            })
+            .collect();
+        (ins, outs)
     };
-    let mut left = Vec::with_capacity(rows * hl);
-    for row in 0..rows {
-        for lane in 0..hl {
-            let name = &fabric.io_inputs[row][lane];
-            left.push(if *name == fabric.naming.constant_zero {
-                LeftPin::Const(false)
-            } else if *name == fabric.naming.constant_one {
-                LeftPin::Const(true)
-            } else {
-                let gate = fabric
-                    .ddio
-                    .iter()
-                    .find(|d| d.input == *name)
-                    .and_then(|d| dir_pos(&d.dir));
-                // A looped input is driven by the board, not by stimulus. The
-                // DDIO gate still applies: such a pad is only an input while its
-                // direction bit is low.
-                match design.loopback_driver(IoPad::input(row, lane)) {
-                    Some(from) => LeftPin::Loop { from: (from.row, from.lane), gate },
-                    None => LeftPin::Stim { name: name.clone(), gate },
-                }
-            });
-        }
-    }
 
     let mut h = vec![false; rows * hl * (columns + 1)];
     let mut v = vec![false; columns * vl * rows];
@@ -325,28 +346,12 @@ fn settle(
         let mut changed = false;
         changed_blocks.clear();
 
+        let (ins, outs) = pad_values(&h);
         for row in 0..rows {
             for lane in 0..hl {
-                let val = match &left[row * hl + lane] {
-                    LeftPin::Const(b) => *b,
-                    LeftPin::Stim { name, gate } => {
-                        let mut x = stimulus.value_at(name, tick);
-                        if let Some((dr, dl)) = gate {
-                            if h[hidx(*dr, *dl, columns)] {
-                                x = false;
-                            }
-                        }
-                        x
-                    }
-                    LeftPin::Loop { from, gate } => {
-                        let mut x = h[hidx(from.0, from.1, columns)];
-                        if let Some((dr, dl)) = gate {
-                            if h[hidx(*dr, *dl, columns)] {
-                                x = false;
-                            }
-                        }
-                        x
-                    }
+                let val = match left[row * hl + lane] {
+                    IoSource::InPad(i) => ins[i],
+                    IoSource::OutPad(o) => outs[o],
                 };
                 let i = hidx(row, lane, 0);
                 if h[i] != val {
@@ -371,14 +376,13 @@ fn settle(
                     }
                 };
                 let cfg = design.clb(col, row);
-                let mut idx = 0usize;
+                let mut inputs = [false; 8];
                 for (k, m) in fabric.input_muxes.iter().enumerate() {
                     let sel = cfg.slice(&m.select) as usize;
-                    let val = src_val(m.sources[sel], col, row, &h, &v, op[ci], carry[ci], ff[ci], carry_in_v);
-                    idx |= (val as usize) << k;
+                    inputs[k] = src_val(m.sources[sel], col, row, &h, &v, op[ci], carry[ci], ff[ci], carry_in_v);
                 }
-                let code = cfg.slice(&fabric.op_select) as usize;
-                let o = fabric.operations[code].table[idx];
+                let idx = fabric.lut_index(&inputs[..fabric.input_muxes.len()]);
+                let o = (cfg.get(fabric.lut.field) >> idx) & 1 != 0;
                 let c = fabric.carry_table[idx];
                 let mut cell_changed = false;
                 if op[ci] != o {
@@ -447,6 +451,7 @@ fn settle(
         })
         .collect();
 
+    let (pads_in, pads_out) = pad_values(&h);
     Ok(Settled {
         tick,
         columns,
@@ -459,6 +464,8 @@ fn settle(
         carry,
         ff: ff.to_vec(),
         carry_edge: fabric.carry.edge,
+        pads_in,
+        pads_out,
         clocks,
     })
 }

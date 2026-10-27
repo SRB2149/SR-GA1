@@ -1,5 +1,6 @@
 //! The configuration a synthesis run produces: one field vector per CLB and
-//! CSB, plus the block names carried through to the design file.
+//! CSB and one for the IO controller, plus the block names carried through to
+//! the design file.
 //!
 //! This is the handover point between the backend and the two emitters. It
 //! knows nothing about nets or cells — everything above it has been resolved
@@ -13,6 +14,7 @@ use std::fmt;
 pub enum BlockId {
     Clb { col: usize, row: usize },
     Csb { col: usize },
+    Io,
 }
 
 impl fmt::Display for BlockId {
@@ -20,6 +22,7 @@ impl fmt::Display for BlockId {
         match self {
             BlockId::Clb { col, row } => write!(f, "CLB({}, {})", col, row),
             BlockId::Csb { col } => write!(f, "CSB{}", col),
+            BlockId::Io => write!(f, "the IO controller"),
         }
     }
 }
@@ -30,6 +33,7 @@ impl BlockId {
         match self {
             BlockId::Clb { col, row } => format!("clb:{},{}", col, row),
             BlockId::Csb { col } => format!("csb:{}", col),
+            BlockId::Io => "io".to_string(),
         }
     }
 }
@@ -80,12 +84,15 @@ pub struct Design {
     rows: usize,
     clbs: Vec<BlockConfig>,
     csbs: Vec<BlockConfig>,
+    io: BlockConfig,
     names: BTreeMap<BlockId, String>,
     /// Which bits of each CLB field were written deliberately, as opposed to
     /// left at their default. Indexed `[clb][field]`, so two routing
     /// decisions sharing one field (lane 0 and lane 1 both live in
     /// `minor_horz_sel`) do not look like a conflict.
     written: Vec<Vec<u64>>,
+    /// The same, for the IO controller's fields.
+    io_written: Vec<u64>,
 }
 
 impl Design {
@@ -95,8 +102,10 @@ impl Design {
             rows: fabric.rows,
             clbs: vec![BlockConfig::new(fabric.clb_fields.len()); fabric.clb_count()],
             csbs: vec![BlockConfig::new(fabric.csb_fields.len()); fabric.columns],
+            io: BlockConfig::new(fabric.io_fields.len()),
             names: BTreeMap::new(),
             written: vec![vec![0; fabric.clb_fields.len()]; fabric.clb_count()],
+            io_written: vec![0; fabric.io_fields.len()],
         }
     }
 
@@ -116,6 +125,101 @@ impl Design {
     }
     pub fn csb_mut(&mut self, col: usize) -> &mut BlockConfig {
         &mut self.csbs[col]
+    }
+    pub fn io(&self) -> &BlockConfig {
+        &self.io
+    }
+    pub fn io_mut(&mut self) -> &mut BlockConfig {
+        &mut self.io
+    }
+
+    pub fn set_io(&mut self, fabric: &Fabric, field: &str, value: u64) -> Result<(), ConfigError> {
+        let Some(idx) = fabric.io_field(field) else {
+            return Err(ConfigError {
+                message: format!("the IO controller has no configuration field named \"{}\"", field),
+            });
+        };
+        let spec = &fabric.io_fields[idx];
+        if value > spec.max() {
+            return Err(ConfigError {
+                message: format!("IO field \"{}\" cannot hold {}; it is {} bits wide", field, value, spec.width),
+            });
+        }
+        self.io.set(idx, spec.width, value);
+        Ok(())
+    }
+
+    pub fn get_io(&self, fabric: &Fabric, field: &str) -> Option<u64> {
+        fabric.io_field(field).map(|i| self.io.get(i))
+    }
+
+    /// Write an IO controller select. Like `apply_slice`, returns the value
+    /// already there if a different write got there first.
+    pub fn apply_io_slice(
+        &mut self,
+        fabric: &Fabric,
+        slice: crate::fabric::FieldSlice,
+        value: u64,
+    ) -> Result<(), u64> {
+        let spec = &fabric.io_fields[slice.field];
+        let current = self.io.get(slice.field);
+        let (mask, shifted) = match slice.bit {
+            Some(bit) => (1u64 << bit, (value & 1) << bit),
+            None => (spec.max(), value & spec.max()),
+        };
+        if self.io_written[slice.field] & mask != 0 && current & mask != shifted {
+            return Err((current & mask) >> slice.bit.unwrap_or(0));
+        }
+        self.io.set(slice.field, spec.width, (current & !mask) | shifted);
+        self.io_written[slice.field] |= mask;
+        Ok(())
+    }
+
+    /// Whether an IO select has been deliberately written.
+    pub fn io_slice_written(&self, slice: crate::fabric::FieldSlice) -> bool {
+        let mask = match slice.bit {
+            Some(bit) => 1u64 << bit,
+            None => u64::MAX,
+        };
+        self.io_written[slice.field] & mask != 0
+    }
+
+    /// The left-edge source a lane reads under this configuration.
+    pub fn left_source(&self, fabric: &Fabric, row: usize, lane: usize) -> crate::fabric::IoSource {
+        match fabric.io_left[row][lane] {
+            crate::fabric::LeftLane::Fixed(source) => source,
+            crate::fabric::LeftLane::Mux(select) => {
+                let code = self.io.get(select.field) as usize;
+                fabric.io_mux_sources.get(code).copied().unwrap_or(fabric.io_mux_sources[0])
+            }
+        }
+    }
+
+    /// The right-edge lane an output-side pad reads under this configuration.
+    pub fn pad_lane(&self, fabric: &Fabric, pad: usize) -> (usize, usize) {
+        match fabric.io_drive[pad] {
+            crate::fabric::PadDrive::Fixed { row, lane } => (row, lane),
+            crate::fabric::PadDrive::Mux(select) => {
+                let code = self.io.get(select.field) as usize;
+                (code / fabric.horz_lanes, code % fabric.horz_lanes)
+            }
+        }
+    }
+
+    /// The config of any block.
+    pub fn block(&self, block: BlockId) -> &BlockConfig {
+        match block {
+            BlockId::Clb { col, row } => self.clb(col, row),
+            BlockId::Csb { col } => self.csb(col),
+            BlockId::Io => &self.io,
+        }
+    }
+    pub fn block_mut(&mut self, block: BlockId) -> &mut BlockConfig {
+        match block {
+            BlockId::Clb { col, row } => self.clb_mut(col, row),
+            BlockId::Csb { col } => self.csb_mut(col),
+            BlockId::Io => &mut self.io,
+        }
     }
 
     /// Set a CLB field by name. Fails rather than silently dropping a value

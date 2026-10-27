@@ -10,3 +10,4 @@ pub mod fabric;
 pub mod naming;
 pub mod sim;
 pub mod trace;
+pub mod utilisation;

@@ -2,8 +2,9 @@
 //!
 //! A trace target is any observable wire, identified by a stable string id
 //! that is saved with the design:
-//!   `in:<name>`      chip input (post-DDIO-gating, as the fabric sees it)
-//!   `out:<name>`     chip output
+//!   `in:<name>`      input-side pad, as the fabric sees it (a DDIO in output
+//!                    mode reads back its own output)
+//!   `out:<name>`     output-side pad, as the IO controller drives it
 //!   `clk:<col>`      column clock
 //!   `ff:<col>:<row>` a CLB's register
 //!   `op:<col>:<row>` a CLB's operation result
@@ -16,8 +17,8 @@ use crate::sim::Settled;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceTarget {
-    Input { row: usize, lane: usize },
-    Output { row: usize, lane: usize },
+    Input { pad: usize },
+    Output { pad: usize },
     Clock { col: usize },
     Ff { col: usize, row: usize },
     Op { col: usize, row: usize },
@@ -31,21 +32,12 @@ pub fn parse_target(fabric: &Fabric, id: &str) -> Result<TraceTarget, String> {
     let num = |s: &str| s.parse::<usize>().map_err(|_| format!("bad number \"{}\" in trace id \"{}\"", s, id));
     match parts.as_slice() {
         ["in", name] => fabric
-            .io_inputs
-            .iter()
-            .enumerate()
-            .find_map(|(row, lanes)| lanes.iter().position(|n| n == name).map(|lane| TraceTarget::Input { row, lane }))
+            .input_pad(name)
+            .map(|pad| TraceTarget::Input { pad })
             .ok_or_else(|| format!("\"{}\" is not a chip input", name)),
         ["out", name] => fabric
-            .io_outputs
-            .iter()
-            .enumerate()
-            .find_map(|(row, lanes)| {
-                lanes
-                    .iter()
-                    .position(|n| n.as_deref() == Some(*name))
-                    .map(|lane| TraceTarget::Output { row, lane })
-            })
+            .output_pad(name)
+            .map(|pad| TraceTarget::Output { pad })
             .ok_or_else(|| format!("\"{}\" is not a chip output", name)),
         ["clk", col] => in_grid(fabric, TraceTarget::Clock { col: num(col)? }),
         ["ff", col, row] => in_grid(fabric, TraceTarget::Ff { col: num(col)?, row: num(row)? }),
@@ -82,8 +74,8 @@ fn in_grid(fabric: &Fabric, t: TraceTarget) -> Result<TraceTarget, String> {
 
 pub fn target_value(t: TraceTarget, s: &Settled) -> bool {
     match t {
-        TraceTarget::Input { row, lane } => s.horz_in(0, row, lane),
-        TraceTarget::Output { row, lane } => s.horz_edge(row, lane),
+        TraceTarget::Input { pad } => s.pad_in(pad),
+        TraceTarget::Output { pad } => s.pad_out(pad),
         TraceTarget::Clock { col } => s.clocks[col],
         TraceTarget::Ff { col, row } => s.clb_ff(col, row),
         TraceTarget::Op { col, row } => s.clb_op(col, row),
@@ -138,7 +130,7 @@ impl Tracer {
     /// same order as `ids`.
     pub fn to_vcd(&self, names: &[String]) -> String {
         let mut out = String::new();
-        out.push_str("$comment SR-GA1 fpgatool trace $end\n");
+        out.push_str("$comment SR-GA1 pnrgui trace $end\n");
         out.push_str("$timescale 1 ns $end\n");
         out.push_str("$scope module fabric $end\n");
         let code = |i: usize| {

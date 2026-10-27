@@ -2,7 +2,7 @@
 //! user's pinned block names. GUI-free; the naming engine and bitstream codec
 //! read from here.
 
-use crate::fabric::{Fabric, Field, FieldSlice};
+use crate::fabric::{Fabric, Field, FieldSlice, IoSource, LeftLane, PadDrive};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
@@ -10,6 +10,8 @@ use std::fmt;
 pub enum BlockId {
     Clb { col: usize, row: usize },
     Csb { col: usize },
+    /// The IO controller: one per chip, holding the edge muxes.
+    Io,
 }
 
 /// The default (auto-generated) name for a block, before pinning.
@@ -17,6 +19,7 @@ pub fn default_name(fabric: &Fabric, block: BlockId) -> String {
     match block {
         BlockId::Clb { col, row } => fabric.clb_name(col, row),
         BlockId::Csb { col } => fabric.csb_name(col),
+        BlockId::Io => fabric.io_name(),
     }
 }
 
@@ -69,41 +72,40 @@ impl fmt::Display for RenameError {
 
 impl std::error::Error for RenameError {}
 
-/// One chip pad, by side and position. Structural like every other index in
-/// this crate, so a pad survives being renamed.
+/// One chip pad, by side and index into the fabric's pad list for that side
+/// (`io_inputs` / `io_outputs`). Structural like every other index in this
+/// crate, so a pad survives being renamed. Pads are chip pins, not fabric
+/// lanes: which lane a pad reaches is IO controller configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct IoPad {
-    /// True for the left-edge input controller, false for the right-edge output.
+    /// True for an input-side pad (what the IO controller reads), false for an
+    /// output-side pad (what it drives).
     pub input_side: bool,
-    pub row: usize,
-    pub lane: usize,
+    pub index: usize,
 }
 
 impl IoPad {
-    pub fn input(row: usize, lane: usize) -> IoPad {
-        IoPad { input_side: true, row, lane }
+    pub fn input(index: usize) -> IoPad {
+        IoPad { input_side: true, index }
     }
-    pub fn output(row: usize, lane: usize) -> IoPad {
-        IoPad { input_side: false, row, lane }
+    pub fn output(index: usize) -> IoPad {
+        IoPad { input_side: false, index }
     }
 
-    /// The reserved name the fabric gives this pad, if it has one.
+    /// Find a pad by the fabric's reserved name.
+    pub fn by_name(fabric: &Fabric, name: &str) -> Option<IoPad> {
+        fabric
+            .output_pad(name)
+            .map(IoPad::output)
+            .or_else(|| fabric.input_pad(name).map(IoPad::input))
+    }
+
+    /// The reserved name the fabric gives this pad, if it exists.
     pub fn reserved_name(self, fabric: &Fabric) -> Option<String> {
         if self.input_side {
-            fabric.io_inputs.get(self.row)?.get(self.lane).cloned()
+            fabric.io_inputs.get(self.index).cloned()
         } else {
-            fabric.io_outputs.get(self.row)?.get(self.lane)?.clone()
-        }
-    }
-
-    /// Whether the fabric ties this pad to a constant, in which case it carries
-    /// no design signal and cannot be renamed or looped.
-    pub fn is_constant(self, fabric: &Fabric) -> bool {
-        match self.reserved_name(fabric) {
-            Some(name) => {
-                name == fabric.naming.constant_zero || name == fabric.naming.constant_one
-            }
-            None => false,
+            fabric.io_outputs.get(self.index).cloned()
         }
     }
 }
@@ -111,10 +113,10 @@ impl IoPad {
 /// A board wire from a chip output pad back to a chip input pad.
 ///
 /// This is wiring outside the chip, so it costs no configuration bits and
-/// appears in no bitstream. It matters here because it is the only way a signal
-/// can travel leftward or return to the cell that produced it — see
-/// `docs/fabric-notes.md` — and because it is combinational, so a cycle closed
-/// through one oscillates exactly as a cycle inside the fabric would.
+/// appears in no bitstream. The IO controller can loop `output_0..3` back
+/// on-chip, so board wiring is only needed beyond that — see
+/// `docs/loop-around.md`. It is combinational, so a cycle closed through one
+/// oscillates exactly as a cycle inside the fabric would.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Loopback {
     /// Output pad the wire starts at.
@@ -133,6 +135,7 @@ pub struct Design {
     pub rows: usize,
     clbs: Vec<CellConfig>,
     csbs: Vec<CellConfig>,
+    io: CellConfig,
     pinned: HashMap<BlockId, String>,
     /// Display names for chip pads. A pad keeps its reserved identity; this is
     /// what the design calls the signal on it.
@@ -148,6 +151,7 @@ impl Design {
             rows: fabric.rows,
             clbs: vec![CellConfig::new(&fabric.clb_fields); fabric.columns * fabric.rows],
             csbs: vec![CellConfig::new(&fabric.csb_fields); fabric.columns],
+            io: CellConfig::new(&fabric.io_fields),
             pinned: HashMap::new(),
             io_names: BTreeMap::new(),
             loopback: Vec::new(),
@@ -183,6 +187,72 @@ impl Design {
     pub fn csb_mut(&mut self, col: usize) -> &mut CellConfig {
         assert!(col < self.columns, "CSB {} out of range", col);
         &mut self.csbs[col]
+    }
+
+    pub fn io(&self) -> &CellConfig {
+        &self.io
+    }
+
+    pub fn io_mut(&mut self) -> &mut CellConfig {
+        &mut self.io
+    }
+
+    /// The config of any block, by id.
+    pub fn block(&self, block: BlockId) -> &CellConfig {
+        match block {
+            BlockId::Clb { col, row } => self.clb(col, row),
+            BlockId::Csb { col } => self.csb(col),
+            BlockId::Io => &self.io,
+        }
+    }
+
+    pub fn block_mut(&mut self, block: BlockId) -> &mut CellConfig {
+        match block {
+            BlockId::Clb { col, row } => self.clb_mut(col, row),
+            BlockId::Csb { col } => self.csb_mut(col),
+            BlockId::Io => &mut self.io,
+        }
+    }
+
+    pub fn get_io(&self, fabric: &Fabric, field: &str) -> Result<u64, String> {
+        let idx = field_index(&fabric.io_fields, field, "IO")?;
+        Ok(self.io.get(idx))
+    }
+
+    pub fn set_io(&mut self, fabric: &Fabric, field: &str, value: u64) -> Result<u64, String> {
+        let idx = field_index(&fabric.io_fields, field, "IO")?;
+        let width = fabric.io_fields[idx].width;
+        Ok(self.io.set(idx, width, value))
+    }
+
+    /// What one left-edge lane reads under the current IO configuration.
+    pub fn left_source(&self, fabric: &Fabric, row: usize, lane: usize) -> IoSource {
+        match fabric.io_left[row][lane] {
+            LeftLane::Fixed(src) => src,
+            LeftLane::Mux(sel) => fabric.io_mux_sources[self.io.slice(&sel) as usize],
+        }
+    }
+
+    /// The right-edge lane driving an output-side pad under the current IO
+    /// configuration, as `(row, lane)`.
+    pub fn pad_lane(&self, fabric: &Fabric, out_pad: usize) -> (usize, usize) {
+        match fabric.io_drive[out_pad] {
+            PadDrive::Fixed { row, lane } => (row, lane),
+            PadDrive::Mux(sel) => fabric.drive_lane(self.io.slice(&sel) as usize),
+        }
+    }
+
+    /// The left-edge lanes currently reading this source.
+    pub fn lanes_reading(&self, fabric: &Fabric, src: IoSource) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for row in 0..fabric.rows {
+            for lane in 0..fabric.horz_lanes {
+                if self.left_source(fabric, row, lane) == src {
+                    out.push((row, lane));
+                }
+            }
+        }
+        out
     }
 
     pub fn get_clb(&self, fabric: &Fabric, col: usize, row: usize, field: &str) -> Result<u64, String> {
@@ -243,6 +313,7 @@ impl Design {
         for col in 0..self.columns {
             out.push(BlockId::Csb { col });
         }
+        out.push(BlockId::Io);
         out
     }
 
@@ -333,14 +404,7 @@ impl Design {
         }
         if pad.reserved_name(fabric).is_none() {
             return Err(RenameError {
-                message: "this lane has no pad on it".to_string(),
-            });
-        }
-        if pad.is_constant(fabric) {
-            return Err(RenameError {
-                message: "this pad is tied to a constant by the fabric and carries no design \
-                          signal"
-                    .to_string(),
+                message: "this fabric has no such pad".to_string(),
             });
         }
         // Renaming a pad to what it is already called is not a collision.
@@ -389,20 +453,9 @@ impl Design {
                 message: "a loop runs from a chip output to a chip input".to_string(),
             });
         }
-        if from.reserved_name(fabric).is_none() {
+        if from.reserved_name(fabric).is_none() || to.reserved_name(fabric).is_none() {
             return Err(RenameError {
-                message: "that output lane has no pad on it".to_string(),
-            });
-        }
-        if to.reserved_name(fabric).is_none() {
-            return Err(RenameError {
-                message: "that input lane has no pad on it".to_string(),
-            });
-        }
-        if to.is_constant(fabric) {
-            return Err(RenameError {
-                message: "that input is tied to a constant by the fabric, so nothing can drive it"
-                    .to_string(),
+                message: "this fabric has no such pad".to_string(),
             });
         }
         self.loopback.retain(|l| l.to != to);
@@ -513,15 +566,8 @@ impl Design {
     /// Just the names the fabric itself reserves.
     fn reserved_names(&self, fabric: &Fabric) -> HashSet<String> {
         let mut used = HashSet::new();
-        for row in &fabric.io_inputs {
-            for name in row {
-                used.insert(name.clone());
-            }
-        }
-        for row in &fabric.io_outputs {
-            for name in row.iter().flatten() {
-                used.insert(name.clone());
-            }
+        for name in fabric.io_inputs.iter().chain(&fabric.io_outputs) {
+            used.insert(name.clone());
         }
         used.insert(fabric.naming.constant_zero.clone());
         used.insert(fabric.naming.constant_one.clone());

@@ -1,7 +1,8 @@
 //! Versioned, human-readable JSON design file: configuration, pinned names,
-//! stimulus, tick, trace flags and opaque view state. Loading against a
-//! different fabric produces clear warnings (or an error when the grid no
-//! longer fits) instead of silently misconfiguring.
+//! stimulus, tick, trace flags and opaque view state. A file written for a
+//! different fabric — another grid size or config layout, or an older file
+//! version — is refused rather than loaded into a configuration it was not
+//! meant for.
 
 use crate::config::{BlockId, Design, IoPad};
 use crate::fabric::Fabric;
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const FILE_VERSION: u32 = 1;
+pub const FILE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct FileError {
@@ -65,7 +66,10 @@ struct FileSchema {
     /// Keys "col".
     #[serde(default)]
     csbs: BTreeMap<String, BTreeMap<String, u64>>,
-    /// Keys "clb:col,row" / "csb:col".
+    /// The IO controller's non-zero fields; omitted when all are zero.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    io: BTreeMap<String, u64>,
+    /// Keys "clb:col,row" / "csb:col" / "io".
     #[serde(default)]
     pinned: BTreeMap<String, String>,
     #[serde(default)]
@@ -105,6 +109,7 @@ struct FabricRef {
     columns: usize,
     rows: usize,
     clb_bits: usize,
+    io_bits: usize,
     csb_bits: usize,
 }
 
@@ -115,6 +120,7 @@ impl FabricRef {
             columns: fabric.columns,
             rows: fabric.rows,
             clb_bits: fabric.clb_bits(),
+            io_bits: fabric.io_bits(),
             csb_bits: fabric.csb_bits(),
         }
     }
@@ -149,11 +155,19 @@ pub fn save_design(fabric: &Fabric, file: &DesignFile) -> String {
             csbs.insert(col.to_string(), fields);
         }
     }
+    let mut io = BTreeMap::new();
+    for (i, field) in fabric.io_fields.iter().enumerate() {
+        let v = file.design.io().get(i);
+        if v != 0 {
+            io.insert(field.name.clone(), v);
+        }
+    }
     let mut pinned = BTreeMap::new();
     for (block, name) in file.design.pinned() {
         let key = match block {
             BlockId::Clb { col, row } => format!("clb:{},{}", col, row),
             BlockId::Csb { col } => format!("csb:{}", col),
+            BlockId::Io => "io".to_string(),
         };
         pinned.insert(key, name.to_string());
     }
@@ -168,6 +182,7 @@ pub fn save_design(fabric: &Fabric, file: &DesignFile) -> String {
         name: file.name.clone(),
         clbs,
         csbs,
+        io,
         pinned,
         stimulus,
         tick: file.tick,
@@ -199,37 +214,59 @@ pub fn save_design(fabric: &Fabric, file: &DesignFile) -> String {
 /// Load a design. Returns the file plus human-readable warnings for anything
 /// that did not carry over (unknown fields, truncated values, bad pins).
 pub fn load_design(fabric: &Fabric, src: &str) -> Result<(DesignFile, Vec<String>), FileError> {
+    // Read the version alone first, so an old file gets a clear message
+    // instead of a complaint about whichever field it happens to lack.
+    #[derive(Deserialize)]
+    struct VersionOnly {
+        version: u32,
+    }
+    let version = serde_json::from_str::<VersionOnly>(src)
+        .map_err(|e| FileError {
+            message: format!("not a valid design file: {}", e),
+        })?
+        .version;
+    if version != FILE_VERSION {
+        return Err(FileError {
+            message: format!(
+                "design file version {} is not supported (this build reads version {}); version 1 \
+                 files predate the LUT-based CLB and the configurable IO controller and must be \
+                 rebuilt",
+                version, FILE_VERSION
+            ),
+        });
+    }
     let schema: FileSchema = serde_json::from_str(src).map_err(|e| FileError {
         message: format!("not a valid design file: {}", e),
     })?;
-    if schema.version != FILE_VERSION {
-        return Err(FileError {
-            message: format!(
-                "design file version {} is not supported (this build reads version {})",
-                schema.version, FILE_VERSION
-            ),
-        });
-    }
     let mut warnings = Vec::new();
     let current = FabricRef::of(fabric);
-    if schema.fabric.columns != current.columns || schema.fabric.rows != current.rows {
+    if schema.fabric.columns != current.columns
+        || schema.fabric.rows != current.rows
+        || schema.fabric.clb_bits != current.clb_bits
+        || schema.fabric.io_bits != current.io_bits
+        || schema.fabric.csb_bits != current.csb_bits
+    {
         return Err(FileError {
             message: format!(
-                "design was built for a {}x{} fabric; the loaded fabric is {}x{}",
-                schema.fabric.columns, schema.fabric.rows, current.columns, current.rows
+                "design was built for a {}x{} fabric with {}/{}/{} CLB/IO/CSB bits; the loaded \
+                 fabric is {}x{} with {}/{}/{}",
+                schema.fabric.columns,
+                schema.fabric.rows,
+                schema.fabric.clb_bits,
+                schema.fabric.io_bits,
+                schema.fabric.csb_bits,
+                current.columns,
+                current.rows,
+                current.clb_bits,
+                current.io_bits,
+                current.csb_bits
             ),
         });
     }
-    if schema.fabric != current {
+    if schema.fabric.name != current.name {
         warnings.push(format!(
-            "design was saved against fabric \"{}\" ({} CLB bits, {} CSB bits); \
-             now loading \"{}\" ({} CLB bits, {} CSB bits) — check the result carefully",
-            schema.fabric.name,
-            schema.fabric.clb_bits,
-            schema.fabric.csb_bits,
-            current.name,
-            current.clb_bits,
-            current.csb_bits
+            "design was saved against fabric \"{}\"; now loading \"{}\" — check the result carefully",
+            schema.fabric.name, current.name
         ));
     }
 
@@ -277,12 +314,23 @@ pub fn load_design(fabric: &Fabric, src: &str) -> Result<(DesignFile, Vec<String
             }
         }
     }
+    for (fname, &value) in &schema.io {
+        match design.set_io(fabric, fname, value) {
+            Ok(stored) if stored != value => warnings.push(format!(
+                "IO field \"{}\": value {} truncated to {}",
+                fname, value, stored
+            )),
+            Ok(_) => {}
+            Err(_) => warnings.push(format!("IO: unknown field \"{}\" ignored", fname)),
+        }
+    }
     for (key, name) in &schema.pinned {
         let block = key
             .strip_prefix("clb:")
             .and_then(parse_pair_str)
             .map(|(col, row)| BlockId::Clb { col, row })
-            .or_else(|| key.strip_prefix("csb:").and_then(|c| c.parse().ok()).map(|col| BlockId::Csb { col }));
+            .or_else(|| key.strip_prefix("csb:").and_then(|c| c.parse().ok()).map(|col| BlockId::Csb { col }))
+            .or_else(|| (key == "io").then_some(BlockId::Io));
         let Some(block) = block else {
             warnings.push(format!("ignoring pinned name with bad key \"{}\"", key));
             continue;
@@ -290,6 +338,7 @@ pub fn load_design(fabric: &Fabric, src: &str) -> Result<(DesignFile, Vec<String
         let in_grid = match block {
             BlockId::Clb { col, row } => col < fabric.columns && row < fabric.rows,
             BlockId::Csb { col } => col < fabric.columns,
+            BlockId::Io => true,
         };
         if !in_grid {
             warnings.push(format!("ignoring pinned name \"{}\": block outside the grid", name));
@@ -351,25 +400,9 @@ pub fn load_design(fabric: &Fabric, src: &str) -> Result<(DesignFile, Vec<String
     ))
 }
 
-/// Find a pad by the fabric's reserved name. Outputs are searched first so a
-/// name appearing on both sides resolves to the output, which is the direction a
-/// loop's `from` always means.
+/// Find a pad by the fabric's reserved name.
 fn find_pad(fabric: &crate::fabric::Fabric, name: &str) -> Option<IoPad> {
-    for (row, lanes) in fabric.io_outputs.iter().enumerate() {
-        for (lane, pad) in lanes.iter().enumerate() {
-            if pad.as_deref() == Some(name) {
-                return Some(IoPad::output(row, lane));
-            }
-        }
-    }
-    for (row, lanes) in fabric.io_inputs.iter().enumerate() {
-        for (lane, pad) in lanes.iter().enumerate() {
-            if pad == name {
-                return Some(IoPad::input(row, lane));
-            }
-        }
-    }
-    None
+    IoPad::by_name(fabric, name)
 }
 
 fn parse_pair(key: &str) -> Option<(usize, usize)> {

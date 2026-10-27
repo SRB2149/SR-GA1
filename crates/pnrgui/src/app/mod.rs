@@ -17,6 +17,7 @@ use fpga_core::fabric::Fabric;
 use fpga_core::naming::{resolve, Namer, NetOrigin, Netlist};
 use fpga_core::sim::{Settled, SimState};
 use fpga_core::trace::Tracer;
+use fpga_core::utilisation::{utilisation, Count, Utilisation};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -28,10 +29,10 @@ pub fn run(open: Option<String>) {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 920.0])
-            .with_title("fpgatool — SR-GA1"),
+            .with_title("pnrgui — SR-GA1"),
         ..Default::default()
     };
-    let _ = eframe::run_native("fpgatool", options, Box::new(move |_cc| Ok(Box::new(shell))));
+    let _ = eframe::run_native("pnrgui", options, Box::new(move |_cc| Ok(Box::new(shell))));
 }
 
 fn boot(open: Option<String>) -> Result<App, String> {
@@ -66,11 +67,25 @@ impl eframe::App for Shell {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.heading("Could not load the fabric description");
                     ui.label(msg.as_str());
-                    ui.label("Fix fabric.toml and restart fpgatool.");
+                    ui.label("Fix fabric.toml and restart pnrgui.");
                 });
             }
         }
     }
+}
+
+/// One cell of a utilisation grid: a swatch coloured by use, with the count.
+fn heat_cell(ui: &mut egui::Ui, count: Count) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(44.0, 18.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 3.0, colors::heat(count.fraction()));
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{}/{}", count.used, count.total),
+        egui::FontId::monospace(10.0),
+        egui::Color32::from_gray(235),
+    );
+    response.on_hover_text(format!("{:.0}% used", 100.0 * count.fraction()));
 }
 
 pub enum Copied {
@@ -102,11 +117,20 @@ pub struct App {
     pub dirty: bool,
 
     pub nets: Netlist,
+    pub util: Utilisation,
     pub drc_items: Vec<DrcItem>,
     pub drc_dismissed: HashSet<String>,
     pub show_drc: bool,
     pub show_history: bool,
     pub show_waves: bool,
+    /// Draw net names on the wires.
+    pub show_net_names: bool,
+    /// Colour the canvas by what the configuration uses.
+    pub show_util_overlay: bool,
+    /// Count a CLB as used only when it is named, so unnamed routing
+    /// pass-throughs do not inflate CLB use.
+    pub util_named_clbs: bool,
+    pub show_util: bool,
 
     pub selected: Option<BlockId>,
     pub io_selected: Option<(bool, usize)>,
@@ -142,6 +166,7 @@ impl App {
     fn new(fabric: Fabric) -> Self {
         let file = DesignFile::new(&fabric, "untitled");
         let nets = resolve(&fabric, &file.design);
+        let util = utilisation(&fabric, &file.design);
         let drc_items = drc::check(&fabric, &file.design);
         App {
             fabric,
@@ -149,11 +174,16 @@ impl App {
             file_path: None,
             dirty: false,
             nets,
+            util,
             drc_items,
             drc_dismissed: HashSet::new(),
             show_drc: false,
             show_history: false,
             show_waves: false,
+            show_net_names: true,
+            show_util_overlay: false,
+            util_named_clbs: true,
+            show_util: false,
             selected: None,
             io_selected: None,
             multi: Vec::new(),
@@ -231,6 +261,7 @@ impl App {
 
     pub fn after_design_change(&mut self) {
         self.nets = resolve(&self.fabric, &self.file.design);
+        self.util = utilisation(&self.fabric, &self.file.design);
         self.drc_items = drc::check(&self.fabric, &self.file.design);
         self.dirty = true;
         if let Some(sim) = &mut self.sim {
@@ -248,6 +279,12 @@ impl App {
     // Selection, copy/paste
 
     pub fn select(&mut self, b: Option<BlockId>) {
+        // The IO controller is inspected from its edge tiles, not as a block.
+        if b == Some(BlockId::Io) {
+            self.select(None);
+            self.io_selected = Some((true, 0));
+            return;
+        }
         self.selected = b;
         self.io_selected = None;
         self.multi.clear();
@@ -284,6 +321,19 @@ impl App {
                 None => value,
             };
             design.clb_mut(col, row).set(slice.field, width, new);
+        });
+    }
+
+    /// Write one IO controller select with undo.
+    pub fn set_slice_io(&mut self, slice: fpga_core::fabric::FieldSlice, value: u64, desc: &str) {
+        let width = self.fabric.io_fields[slice.field].width;
+        self.apply(desc, move |design, _| {
+            let old = design.io().get(slice.field);
+            let new = match slice.bit {
+                Some(b) => (old & !(1 << b)) | ((value & 1) << b),
+                None => value,
+            };
+            design.io_mut().set(slice.field, width, new);
         });
     }
 
@@ -324,7 +374,7 @@ impl App {
                 self.copied = Some(Copied::Csb(self.file.design.csb(col).clone()));
                 self.toast("copied CSB configuration".to_string());
             }
-            None => {}
+            Some(BlockId::Io) | None => {}
         }
     }
 
@@ -421,36 +471,30 @@ impl App {
     /// The design's name for a pad, given the fabric's reserved name for it.
     /// Falls back to the reserved name, which is what an unnamed pad shows.
     pub fn pad_display_name(&self, reserved: &str) -> String {
-        for row in 0..self.fabric.rows {
-            for lane in 0..self.fabric.horz_lanes {
-                if self.fabric.io_inputs[row][lane] == reserved {
-                    if let Some(name) = self.file.design.io_name(IoPad::input(row, lane)) {
-                        return name.to_string();
-                    }
-                }
-                if self.fabric.io_outputs[row][lane].as_deref() == Some(reserved) {
-                    if let Some(name) = self.file.design.io_name(IoPad::output(row, lane)) {
-                        return name.to_string();
-                    }
-                }
-            }
+        IoPad::by_name(&self.fabric, reserved)
+            .and_then(|pad| self.file.design.io_name(pad))
+            .unwrap_or(reserved)
+            .to_string()
+    }
+
+    /// The display name of an IO controller source: a pad, or an output read
+    /// back on-chip.
+    pub fn io_source_label(&self, src: fpga_core::fabric::IoSource) -> String {
+        let reserved = self.fabric.io_source_name(src).to_string();
+        let shown = self.pad_display_name(&reserved);
+        match src {
+            fpga_core::fabric::IoSource::InPad(_) if shown == reserved => shown,
+            fpga_core::fabric::IoSource::InPad(_) => format!("{} ({})", shown, reserved),
+            fpga_core::fabric::IoSource::OutPad(_) if shown == reserved => format!("{} (on-chip loop)", shown),
+            fpga_core::fabric::IoSource::OutPad(_) => format!("{} ({}, on-chip loop)", shown, reserved),
         }
-        reserved.to_string()
     }
 
     /// Whether the board drives this input pad, so stimulus cannot.
     pub fn input_is_driven(&self, name: &str) -> Option<String> {
-        for row in 0..self.fabric.rows {
-            for lane in 0..self.fabric.horz_lanes {
-                if self.fabric.io_inputs[row][lane] != name {
-                    continue;
-                }
-                if let Some(from) = self.file.design.loopback_driver(IoPad::input(row, lane)) {
-                    return self.file.design.effective_io_name(&self.fabric, from);
-                }
-            }
-        }
-        None
+        let pad = IoPad::input(self.fabric.input_pad(name)?);
+        let from = self.file.design.loopback_driver(pad)?;
+        self.file.design.effective_io_name(&self.fabric, from)
     }
 
     pub fn toast(&mut self, msg: String) {
@@ -543,7 +587,14 @@ impl App {
             let wrap = if self.wrap_export { Some(80) } else { None };
             let text = bitstream::format_text(&self.fabric, &self.file.design, &self.file.name, &timestamp, false, wrap);
             match std::fs::write(&path, text) {
-                Ok(()) => self.toast(format!("exported {} bits", self.fabric.total_bits())),
+                Ok(()) => self.toast(match self.fabric.start_bit {
+                    Some(_) => format!(
+                        "exported {} bits (start bit + {} configuration bits)",
+                        self.fabric.stream_bits(),
+                        self.fabric.total_bits()
+                    ),
+                    None => format!("exported {} bits", self.fabric.total_bits()),
+                }),
                 Err(e) => self.toast(format!("cannot write {}: {}", path.display(), e)),
             }
         }
@@ -668,6 +719,7 @@ impl App {
                         Some(BlockId::Csb { col })
                     }
                 }
+                Some(BlockId::Io) => Some(BlockId::Clb { col: 0, row: 0 }),
             };
             self.select(next);
             self.center_on = next;
@@ -727,6 +779,7 @@ impl App {
 
         self.drc_window(ctx);
         self.history_window(ctx);
+        self.util_window(ctx);
         self.toast_overlay(ctx, now);
 
         if self.sim.as_ref().is_some_and(|s| s.running) {
@@ -803,6 +856,14 @@ impl App {
                     ui.close_menu();
                 }
                 ui.checkbox(&mut self.show_waves, "Waveform panel");
+                ui.separator();
+                ui.checkbox(&mut self.show_net_names, "Signal names on wires");
+                ui.checkbox(&mut self.show_util_overlay, "Utilisation overlay");
+                ui.checkbox(&mut self.util_named_clbs, "Count only named CLBs");
+                if ui.button("Utilisation…").clicked() {
+                    self.show_util = true;
+                    ui.close_menu();
+                }
             });
             ui.separator();
             let name_edit = egui::TextEdit::singleline(&mut self.file.name)
@@ -882,6 +943,98 @@ impl App {
             self.select(Some(b));
             self.center_on = Some(b);
         }
+    }
+
+    /// Summary bars for every resource, then per-lane occupancy grids for the
+    /// routing — the same measure the overlay colours the canvas by.
+    fn util_window(&mut self, ctx: &egui::Context) {
+        if !self.show_util {
+            return;
+        }
+        let mut open = self.show_util;
+        let mut overlay = self.show_util_overlay;
+        egui::Window::new("Utilisation")
+            .open(&mut open)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.checkbox(&mut overlay, "colour the canvas by use");
+                ui.checkbox(&mut self.util_named_clbs, "count only named CLBs")
+                    .on_hover_text(
+                        "A routed design configures every CLB a signal passes through. \
+                         The synthesiser names the CLBs that hold logic, so counting only \
+                         named ones shows real logic use.",
+                    );
+                ui.label(
+                    egui::RichText::new(
+                        "used = carries a configured signal that reaches a chip output or a live \
+                         register's clock; the all-zero defaults do not count",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(130)),
+                );
+                ui.separator();
+                let u = &self.util;
+                let rows: [(&str, Count); 10] = [
+                    if self.util_named_clbs { ("CLBs (named)", u.named_clbs) } else { ("CLBs (configured)", u.clbs) },
+                    ("registers", u.registers),
+                    ("carry links", u.carry_links),
+                    ("clock selectors (CSB)", u.csbs),
+                    ("horizontal segments", u.horz_segments),
+                    ("vertical segments", u.vert_segments),
+                    ("input pads", u.input_pads),
+                    ("output pads", u.output_pads),
+                    ("input muxes", u.input_muxes),
+                    ("on-chip loops", u.on_chip_loops),
+                ];
+                egui::Grid::new("util_summary").num_columns(3).striped(true).show(ui, |ui| {
+                    for (label, count) in rows {
+                        ui.label(label);
+                        ui.monospace(format!("{:>3} / {:<3}", count.used, count.total));
+                        ui.add(
+                            egui::ProgressBar::new(count.fraction())
+                                .desired_width(200.0)
+                                .fill(colors::heat(count.fraction()))
+                                .text(format!("{:.0}%", 100.0 * count.fraction())),
+                        );
+                        ui.end_row();
+                    }
+                });
+
+                ui.separator();
+                ui.label(egui::RichText::new("horizontal lanes (segments used per row and lane)").strong());
+                egui::Grid::new("util_horz").show(ui, |ui| {
+                    ui.label("");
+                    for lane in (0..self.fabric.horz_lanes).rev() {
+                        ui.monospace(format!("h{}", lane));
+                    }
+                    ui.end_row();
+                    for row in (0..self.fabric.rows).rev() {
+                        ui.monospace(format!("row {}", row));
+                        for lane in (0..self.fabric.horz_lanes).rev() {
+                            heat_cell(ui, self.util.horz_by_lane(row, lane));
+                        }
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("vertical lanes (segments used per column and lane)").strong());
+                egui::Grid::new("util_vert").show(ui, |ui| {
+                    ui.label("");
+                    for col in 0..self.fabric.columns {
+                        ui.monospace(format!("c{}", col));
+                    }
+                    ui.end_row();
+                    for lane in (0..self.fabric.vert_lanes).rev() {
+                        ui.monospace(format!("v{}", lane));
+                        for col in 0..self.fabric.columns {
+                            heat_cell(ui, self.util.vert_by_lane(col, lane));
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        self.show_util = open;
+        self.show_util_overlay = overlay;
     }
 
     fn history_window(&mut self, ctx: &egui::Context) {

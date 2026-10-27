@@ -17,12 +17,12 @@ SystemVerilog
   │    └─ subset check ............... subset.rs      on the elaborated netlist
   ├─ Yosys: alumacc + arith_map ...... carry.rs       adders onto the carry chain
   ├─ Yosys: dfflegalize .............. yosys.rs       one flop shape
-  ├─ ABC: map against fabric.genlib .. genlib.rs      derived cell library
+  ├─ ABC: map against fabric.genlib .. genlib.rs      every <=3-input function
   ├─ pack ............................ pack.rs        fuse flops, thread chains, assign enables
   │
   ├─ outer search loop ............... flow.rs        many seeds, keep the best
   │    ├─ place + assign pins ........ place.rs       simulated annealing
-  │    ├─ build the routing problem .. backend.rs     nets, sinks, constants, enables
+  │    ├─ build the routing problem .. backend.rs     nets, pads, enables, DDIO ties
   │    ├─ route ...................... route.rs       PathFinder over rrg.rs
   │    ├─ emit configuration ......... backend.rs     every edge names its own write
   │    └─ loop check ................. loops.rs       refuse any combinational cycle
@@ -39,18 +39,18 @@ netlists, the genlib, the implementation table, the arithmetic map and, with
 ## The pieces that carry the weight
 
 **`fabric.rs`** is the only thing that knows the hardware. Dimensions, config
-field layout, mux legality, the operation library, IO maps and the scan chain all
-come from `fabric.toml`; nothing downstream hard-codes 7×4 or a lane number.
-Where a rule about the fabric is needed in more than one place it lives here as a
-derived predicate — `constant_reaches_input`, `register_feedback_possible`,
+field layout, mux legality, the LUT and its index order, the IO controller and
+the scan chain all come from `fabric.toml`; nothing downstream hard-codes 8×4 or
+a lane number. Where a rule about the fabric is needed in more than one place it
+lives here as a derived predicate — `constant_reaches_lane`,
+`lanes_for_source`, `lanes_for_output`, `register_feedback_possible`,
 `vert_pass_target` — rather than being re-derived.
 
-**`genlib.rs`** derives the cell library instead of shipping one. Every operation
-is cofactored against every way of tying its inputs, which produces the degraded
-two-input forms, `INV`, `BUF`, the don't-care forms and the shared-pin forms
-automatically, each with an ordered list of *physical* implementations. That list
-is what lets Phase 6 re-map a cell whose constant turned out to be unroutable
-without re-running ABC.
+**`genlib.rs`** derives the cell library instead of shipping one: every function
+of up to three pins that uses all of them, each with every *physical*
+implementation — a placement of its pins on inputs `a`/`b`/`c` and the LUT value
+that computes it from there. Placement picks among them so a pin sits on an
+input that can see the lane its signal arrives on, without re-running ABC.
 
 **`rrg.rs`** is the routing resource graph, and the piece everything else trusts.
 Every node is a place a signal can be, every edge is a mux code, and **each edge
@@ -58,8 +58,11 @@ carries the configuration write it implies** — so a routed path already *is* a
 bitstream, with no second translation step that could disagree with the first.
 Two modelling decisions do a lot of work: lane 3's register enable is the *same
 node* as lane 3's wire, so single occupancy resolves "route past" against "hold
-enabled" by itself; and a buffer is a priced edge through a CLB's operation core,
-so the router allocates its own vertical hops.
+enabled" by itself; and a buffer is a priced edge through a CLB's LUT, so the
+router allocates its own vertical hops. Chip pads are nodes too: the IO
+controller's input and output muxes are edges carrying IO configuration writes,
+and a chip output the controller can read back is an `OnChipLoop` edge to the
+left edge, so feedback needs no special handling.
 
 **`route.rs`** is PathFinder: rip up one net at a time and reroute it against
 everyone else's current routes, with history accumulating on contested nodes.
@@ -68,9 +71,10 @@ by exactly one mux.
 
 **`loops.rs`** reads the *realised* mux selects out of the finished
 configuration, not the routing, so it also catches cycles through CLBs nobody
-routed through. Loop-around board wires are included as combinational edges. The
-flip-flop is the only edge left out, which is what makes registered feedback
-legal and combinational feedback not.
+routed through. The IO controller's selects, on-chip loops, DDIO read-back and
+board wires are all included as combinational edges, and a LUT contributes only
+the inputs its truth table reads. The flip-flop is the only edge left out, which
+is what makes registered feedback legal and combinational feedback not.
 
 ## The outer loop
 
@@ -91,7 +95,8 @@ the same input and seed produce a byte-identical bitstream, which is tested.
   its input, output and direction nets.
 - **Loop-around wiring is never assumed.** It is board wiring the tool cannot
   see, so it is declared, and the pairing the router chose is reported for
-  soldering.
+  soldering. On-chip loops through the IO controller need no declaration: they
+  are configuration, and the router uses them by itself.
 - **Constraints are never silently ignored.** A pin lock, placement or clock
   assignment naming something the design does not have is an error with a line
   number. See `docs/constraints.md`.
@@ -116,5 +121,5 @@ the same input and seed produce a byte-identical bitstream, which is tested.
 ## Non-goals
 
 No timing-driven optimisation: the fabric has no timing model, so reported
-"depth" is a structural count of operation cores, not a delay. No partial
+"depth" is a structural count of LUTs, not a delay. No partial
 reconfiguration and no incremental synthesis.

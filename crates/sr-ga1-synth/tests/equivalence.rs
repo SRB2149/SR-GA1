@@ -118,21 +118,49 @@ fn a_carry_chain_adder_matches_its_source() {
     assert_eq!(outcome.packed.chains.len(), 1, "the adder should use the carry chain");
 }
 
-/// The counter needs everything at once: the carry chain, a derived clock,
-/// lane-3 enables, and feedback through board wiring. If the loop-around
-/// modelling were wrong, this is where it would show.
+/// An adder wider than a column, split into segments joined by carry taps.
 #[test]
-fn a_counter_through_loop_around_wiring_matches_its_source() {
+fn a_segmented_adder_matches_its_source() {
     if tools().is_none() {
         return;
     }
-    let outcome =
-        check("count4.sv", "count4", "count4", Some("loopback.toml"), 800);
+    check("add5.sv", "add5", "add5", None, 800);
+}
+
+/// Carry-in from a port and carry-out through a tap.
+#[test]
+fn an_adder_with_carry_in_and_out_matches_its_source() {
+    if tools().is_none() {
+        return;
+    }
+    check("add4c.sv", "add4c", "add4c", None, 800);
+}
+
+/// The counter needs everything at once: the carry chain, a derived clock,
+/// lane-3 enables, and feedback through the IO controller's on-chip loops. If
+/// the IO modelling were wrong, this is where it would show.
+#[test]
+fn a_counter_through_on_chip_loops_matches_its_source() {
+    if tools().is_none() {
+        return;
+    }
+    let outcome = check("count4.sv", "count4", "count4", None, 800);
     assert_eq!(outcome.packed.register_count(), 4);
     assert!(
-        !sr_ga1_synth::report::loopback_wiring(&outcome).is_empty(),
-        "this design is only buildable through the board wiring, so it must use some"
+        !sr_ga1_synth::report::on_chip_loops(&outcome).is_empty(),
+        "each count bit has to come back to its adder cell, so some loop must be used"
     );
+}
+
+/// The same counter with a board pool declared too: the testbench wires any
+/// board loops the configuration uses.
+#[test]
+fn a_counter_with_a_board_pool_matches_its_source() {
+    if tools().is_none() {
+        return;
+    }
+    let outcome = check("count4.sv", "count4", "count4-pool", Some("loopback.toml"), 800);
+    assert_eq!(outcome.packed.register_count(), 4);
 }
 
 /// Two clock domains: the columns are partitioned between them and each
@@ -148,10 +176,11 @@ fn two_clock_domains_match_their_source() {
     assert_eq!(outcome.packed.clocks.len(), 2);
 }
 
+/// A register that depends on its own value, fed back on-chip.
 #[test]
-fn a_self_dependent_register_through_board_wiring_matches_its_source() {
+fn a_self_dependent_register_matches_its_source() {
     if tools().is_none() {
         return;
     }
-    check("toggle.sv", "toggle", "toggle", Some("loopback.toml"), 800);
+    check("toggle.sv", "toggle", "toggle", None, 800);
 }

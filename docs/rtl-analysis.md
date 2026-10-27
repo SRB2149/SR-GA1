@@ -1,13 +1,15 @@
-# SR-GA1 RTL Analysis (Phase 0)
+# SR-GA1 RTL Analysis
 
 Derived from the SystemVerilog in `hdl/`, cross-checked against the svunit tests in
 `hdl/**/*_unit_test.sv`. Sources read: `clb.sv`, `clb_grid.sv`, `sr-ga1.sv`,
-`clock_sel.sv`, `clock_bank.sv`, `io_controller.sv`, `mux.sv`, `shift_reg_no_reset.sv`.
+`clock_sel.sv`, `clock_bank.sv`, `io_controller.sv`, `shift_reg_no_reset.sv`.
+First written for Phase 0 (2026-08-28); revised 2026-10-12 for the LUT3 CLB, the
+8-column grid, the configurable IO controller and the programming freeze.
 
 `clb_blackbox.sv` is an STA/synthesis blackbox stub of the same `CLB` module
 (marked `/// sta-blackbox`) and carries no behaviour — ignored.
 
-Fabric dimensions in `SR_GA1`: **7 columns × 4 rows** (`CLB_Grid #(.ROWS(4), .COLUMNS(7))`).
+Fabric dimensions in `SR_GA1`: **8 columns × 4 rows** (`localparam COLUMNS = 8`).
 `ROWS` is a grid parameter but the IO controller is hard-wired for 4 rows;
 `COLUMNS` is freely parameterizable (clock bank scales with it).
 
@@ -21,27 +23,26 @@ around** to row 0 at the top level, tapping the clock bank at the loop point.
 
 ## 1. CLB internals
 
-### 1.1 There is no LUT
+### 1.1 A 3-input LUT
 
-The prompt anticipated a LUT; the RTL instead has a **fixed 8-function
-operation core** selected by a 3-bit `operation_select`. All eight functions are
-computed combinationally from the three selected inputs `a`, `b`, `c`, and an
-8:1 mux picks one:
+The CLB computes `operation_result = lut[lut_sel]` with
+`lut_sel = {input_a, input_b, input_c}`: an 8-bit truth table, input **`a` the
+most significant** index bit. Any function of the three selected inputs is
+available. The unit test's named configurations, used by the tools as presets:
 
-| `operation_select` | Function | Expression |
+| Name | LUT | Expression |
 |---|---|---|
-| 0 (`000`) | AND3  | `a & b & c` |
-| 1 (`001`) | OR3   | `a \| b \| c` |
-| 2 (`010`) | XOR3  | `a ^ b ^ c` |
-| 3 (`011`) | NAND3 | `!(a & b & c)` |
-| 4 (`100`) | NOR3  | `!(a \| b \| c)` |
-| 5 (`101`) | XNOR3 | `!(a ^ b ^ c)` |
-| 6 (`110`) | AO21  | `(a & b) \| c` |
-| 7 (`111`) | MUX2  | `c ? a : b` |
+| AND3  | `0x80` | `a & b & c` |
+| OR3   | `0xFE` | `a \| b \| c` |
+| XOR3  | `0x96` | `a ^ b ^ c` |
+| NAND3 | `0x7F` | `!(a & b & c)` |
+| NOR3  | `0x01` | `!(a \| b \| c)` |
+| XNOR3 | `0x69` | `!(a ^ b ^ c)` |
+| AO21  | `0xEA` | `(a & b) \| c` |
+| MUX2  | `0xE4` | `c ? a : b` |
 
-The unit test names them AND3/OR3/…/AO21/MUX2 — the tool should use those
-names. (Code 6 was originally SUM1, the full-adder sum bit; it was changed to
-AO21 on 2026-08-28 since SUM1 duplicated XOR3.)
+The all-zero default is the constant-0 function. (Until 2026-10-02 this was a
+fixed 8-operation core selected by a 3-bit `operation_select`.)
 
 ### 1.2 Input muxes
 
@@ -72,11 +73,11 @@ plus two off-bus sources.
 > two vertical lanes carrying `operation_result` (lanes 0 and 2 carry `op`;
 > lanes 1 and 3 carry `operation_ff`). Feeding a combinational lane back into
 > the logic means a vertical ring configured as pass-through can close a loop
-> through a CLB's own operation core. The shortest one: CLB(c,r) drives `op`
+> through a CLB's own LUT. The shortest one: CLB(c,r) drives `op`
 > onto `vert_bus_out[2]`, the other three rows pass through (`minor_vert_sel`
 > = 0b0001, 0b0100, 0b0001, following the 0<->2 lane swap), and the signal
 > arrives back at `vert_bus_in[0]` of row r, which input mux c reads. With an
-> inverting operation that oscillates; with a non-inverting one it latches.
+> inverting LUT that oscillates; with a non-inverting one it latches.
 > DRC reports every such cycle as an error and the simulator refuses to
 > settle rather than hanging. Empirically ~90% of *randomly* configured
 > fabrics now contain at least one such cycle, so DRC matters much more than
@@ -103,11 +104,11 @@ always_ff @ (posedge clk)
 - **Bypassable**: yes, in the sense that `operation_result` and `operation_ff`
   are separately routable outputs; the FF is never in the combinational path.
 - **Reset** is global and **synchronous**: it wins over the enable, and loads
-  the configured `op_ff_reset_val` (config bit 19) on the column's next rising
+  the configured `op_ff_reset_val` (config bit 24) on the column's next rising
   clock edge. Default 0, like every config bit.
 - The CLB has **no other clock-related configuration** — no edge select, no
-  gating, no clock mux. Its clock is hard-wired to the column clock chain
-  (`clk` in → `clk_out` pass-through down the column from the CSB).
+  gating, no clock mux. Its clock is hard-wired to the column clock chain,
+  which enters at the top row and is passed down (`clk` in → `clk_out`).
 
 ### 1.4 The carry chain
 
@@ -127,7 +128,7 @@ only way off the chain is through the next cell's logic (e.g. selecting
 carry-in on input c and reading the result on `operation_result`).
 
 **Building an adder**: configure a column's cells with `a` and `b` on the
-horizontal lanes, input c = `carry_in`, and operation = XOR3. XOR3 of
+horizontal lanes, input c = `carry_in`, and LUT = XOR3 (`0x96`). XOR3 of
 (a, b, carry_in) is the sum bit on `operation_result`, and `carry_out` is the
 matching carry — a textbook full-adder cell per CLB, rippling up the column.
 
@@ -136,7 +137,7 @@ No carry-specific config bits exist beyond the 2-bit input mux c select.
 (Added 2026-08-28: previously carry-out was an ordinary routable source on
 the major output muxes and there was no carry-in.)
 
-### 1.5 Full ordered per-CLB config bit list (20 bits)
+### 1.5 Full ordered per-CLB config bit list (25 bits)
 
 Shift-register indices (index 0 is nearest `shift_data_in`, i.e. holds the
 **last** bit shifted in):
@@ -146,15 +147,14 @@ Shift-register indices (index 0 is nearest `shift_data_in`, i.e. holds the
 | 0 | `input_mux_a_sel` | 1 | 0: h0, 1: h1 |
 | 1 | `input_mux_b_sel` | 1 | 0: h1, 1: h2 |
 | 2–3 | `input_mux_c_sel[1:0]` | 2 | see §1.2 (bit 2 = LSB) |
-| 4–6 | `operation_select[2:0]` | 3 | see §1.1 (bit 4 = LSB) |
-| 7–8 | `minor_horz_sel[1:0]` | 2 | see §2.3 |
-| 9–12 | `minor_vert_sel[3:0]` | 4 | see §2.3 |
-| 13–15 | `major_horz2_sel[2:0]` | 3 | see §2.3 (bit 13 = LSB) |
-| 16–18 | `major_horz3_sel[2:0]` | 3 | see §2.3 (bit 16 = LSB) |
-| 19 | `op_ff_reset_val` | 1 | FF synchronous reset value |
+| 4–11 | `lut[7:0]` | 8 | see §1.1 (bit 4 = `lut[0]`) |
+| 12–13 | `minor_horz_sel[1:0]` | 2 | see §2.3 |
+| 14–17 | `minor_vert_sel[3:0]` | 4 | see §2.3 |
+| 18–20 | `major_horz2_sel[2:0]` | 3 | see §2.3 (bit 18 = LSB) |
+| 21–23 | `major_horz3_sel[2:0]` | 3 | see §2.3 (bit 21 = LSB) |
+| 24 | `op_ff_reset_val` | 1 | FF synchronous reset value |
 
-Total: **20 bits per CLB**. All defaults 0. (Was 19 before input mux c was
-widened on 2026-08-28.)
+Total: **25 bits per CLB**. All defaults 0.
 
 ---
 
@@ -282,8 +282,9 @@ Behaviour: `clk = couple_to_previous ? prev_clk : bus[bus_addr]`.
   `prev_clk[0] = clks[CLK_NUM-1]` — column N couples from column N−1, column 0
   from the last column, forming a loop. (Confirmed by `test_clk_passthrough`:
   CSB6 coupled to CSB5.)
-- **Distribution**: the selected clock drives `column_clks[c]` into row 0's
-  CLB and is passed combinationally down the column (`clk_out = clk`), so a
+- **Distribution**: the selected clock drives `column_clks[c]` into the top
+  row's CLB and is passed combinationally down the column (`clk_out = clk`),
+  as is reset — moved there on 2026-10-10 to ease routing at the bottom — so a
   CSB clocks **every CLB in its column** on a dedicated network. The clock
   never touches the routing fabric in the drive direction; the only crossing
   is the CSB *taking* its input from the vertical ring. Confirmed: no output
@@ -306,42 +307,54 @@ the tap point.
 
 ---
 
-## 4. IO controllers
+## 4. IO controller
 
-The `IO_Controller` is purely combinational and holds **zero config bits**.
-Chip IO: 10 inputs, 10 outputs, 2 dual-direction (DDIO) pins.
+The `IO_Controller` holds **64 config bits** in its own shift register, which
+sits in the chain between the CLB grid and the clock bank. Chip IO: 10 inputs,
+10 outputs, 2 dual-direction (DDIO) pins.
 
-**Input side (left edge)** — drives `horz_bus_in` per row at column 0:
+**DDIO read-back.** `ddio_in_pre_mux[k] = ddio_dir[k] ? ddio_out[k] : ddio_in[k]`:
+while a DDIO pad is an output, the fabric reads its own output back.
 
-| Row | Lane 0 | Lane 1 | Lane 2 | Lane 3 |
-|---|---|---|---|---|
-| 0 | `chip_inputs[0]` | `chip_inputs[1]` | `chip_inputs[2]` | `chip_inputs[3]` |
-| 1 | `chip_inputs[4]` | `chip_inputs[5]` | `chip_inputs[6]` | `chip_inputs[7]` |
-| 2 | `chip_inputs[8]` | `chip_inputs[9]` | `ddio_in[0]`* | `ddio_in[1]`* |
-| 3 | constant 0 | constant 1 | constant 0 | constant 1 |
+**Input side (left edge)** — drives `horz_bus_in` per row at column 0. Lanes
+0/1 of every row are 16:1 input muxes (4-bit selects `input_mux_sel{row}{a,b}`)
+over:
 
-\* DDIO inputs are gated: forced to 0 when the corresponding `ddio_dir` bit is
-1 (pin configured as output).
+| Code | Source |
+|---|---|
+| 0–9 | `chip_inputs[0..9]` |
+| 10–11 | `ddio_in_pre_mux[0..1]` |
+| 12–15 | `chip_outputs[0..3]` — read back on-chip |
 
-Row 3's constant `4'b1010` means: free `fixed_zero` on lanes 0/2, `fixed_one`
-on lanes 1/3 — and, importantly, **row 3's FF enables (lane 3) default to 1**
-at the left edge, while rows 0–2's registers are enabled by whatever chip
-input or routed signal sits on their lane 3.
+Lanes 2/3 are fixed:
 
-**Output side (right edge)** — reads `horz_bus_out` at the last column:
+| Row | Lane 2 | Lane 3 |
+|---|---|---|
+| 0 | `chip_inputs[2]` | `chip_inputs[3]` |
+| 1 | `chip_inputs[6]` | `chip_inputs[7]` |
+| 2 | `ddio_in_pre_mux[0]` | `ddio_in_pre_mux[1]` |
+| 3 | `chip_inputs[8]` | `chip_inputs[9]` |
 
-| Row | Lane 0 | Lane 1 | Lane 2 | Lane 3 |
-|---|---|---|---|---|
-| 0 | `outputs[0]` | `outputs[1]` | `outputs[2]` | `outputs[3]` |
-| 1 | `outputs[4]` | `outputs[5]` | `outputs[6]` | `outputs[7]` |
-| 2 | `outputs[8]` | `outputs[9]` | `ddio_out[0]` | `ddio_out[1]` |
-| 3 | `ddio_dir[0]` | `ddio_dir[1]` | — unused | — unused |
+There are **no constants** at the left edge any more (until 2026-10-03 row 3
+entered as `0,1,0,1`), so lane 3 at column 0 — the FF enable — is always a chip
+input. Codes 12–15 are the on-chip loop: a chip output, which comes from the
+right edge, re-enters on the left.
 
-`ddio_dir` (row 3 lanes 0/1) both steers the DDIO pads and gates the DDIO
-input paths on row 2.
+**Output side (right edge)** — `chip_outputs[0..3]`, `ddio_out[0..1]` and
+`ddio_dir[0..1]` are 16:1 output muxes over `from_fabric_buses`, code
+`row * 4 + lane`. `chip_outputs[4..9]` are fixed to lanes 6, 7, 10, 11, 14, 15:
+rows 1–3, lanes 2/3.
 
-Suggested reserved names: `input_0`…`input_9`, `output_0`…`output_9`,
-`ddio_in_0/1`, `ddio_out_0/1`, `ddio_dir_0/1`, `fixed_zero`, `fixed_one`.
+**Freeze.** While `freeze_fabric` is set (§6.4) every chip output and DDIO
+output/direction is forced to 0, so DDIO pads are inputs during programming.
+
+**Config register** (index 0 nearest `shift_data_in`): `input_mux_sel0a` (0–3),
+`0b`, `1a`, `1b`, `2a`, `2b`, `3a`, `3b` (28–31), `output_mux_sel0..3` (32–47),
+`output_mux_sel_ddio0/1` (48–55), `output_mux_sel_ddio_dir0/1` (56–63).
+
+Reserved names: `input_0`…`input_9`, `output_0`…`output_9`, `ddio_in_0/1`,
+`ddio_out_0/1`, `ddio_dir_0/1`, and `fixed_zero`/`fixed_one` for the major-mux
+constants.
 
 ---
 
@@ -352,7 +365,8 @@ Suggested reserved names: `input_0`…`input_9`, `output_0`…`output_9`,
   it in the same cycle.
 - It is sampled **synchronously** on each column's clock, so columns in
   different clock domains come out of reset on their own clock edges.
-- Per-CLB reset value: config bit 19 (`op_ff_reset_val`).
+- Per-CLB reset value: config bit 24 (`op_ff_reset_val`).
+- Reset also clears the programming freeze (§6.4) on its falling edge.
 - The configuration shift registers (`Shift_Reg_No_Reset`) are **not** reset —
   power-on config is undefined in silicon; the tool's model defaults every
   field to 0.
@@ -367,53 +381,72 @@ One serial chain through the whole chip:
 
 ```
 shift_data_in
-  → CLB(row0,col0) → CLB(row0,col1) → … → CLB(row0,col6)     ┐ row-major
-  → CLB(row1,col0) → …                → CLB(row3,col6)        ┘ raster
-  → CSB0 → CSB1 → … → CSB6
+  → CLB(row0,col0) → CLB(row0,col1) → … → CLB(row0,col7)     ┐ row-major
+  → CLB(row1,col0) → …                → CLB(row3,col7)        ┘ raster
+  → IO controller (64 bits)
+  → CSB0 → CSB1 → … → CSB7
   → shift_data_out
 ```
 
 The grid raster is confirmed by the drawing in `clb_grid.sv` (cell 000 at
 row 0/col 0, snaking 000→001→…) and the generate block's
-`shift_data_chain[r-1][COLUMNS-1]` row wrap. The clock bank sits after the
-grid (`clb_clk_data_bridge` in `sr-ga1.sv`).
+`shift_data_chain[r-1][COLUMNS-1]` row wrap. The IO controller and then the
+clock bank follow the grid (`clb_io_data_bridge`, `io_clk_data_bridge` in
+`sr-ga1.sv`).
 
 Within each cell, `Shift_Reg_No_Reset` shifts from index 0 toward index
 DEPTH−1, and `data_out = data[DEPTH-1]`.
 
 ### 6.2 Transmission order (what the exported file must contain)
 
-Because first-shifted bits travel deepest, the bit that must be transmitted
-**first** is the one destined for the deepest register bit — CSB6's
+Because first-shifted bits travel deepest, the configuration bit that must be
+transmitted **first** is the one destined for the deepest register bit — CSB7's
 `couple_to_previous` — and the bit transmitted **last** lands in CLB(0,0)'s
-`input_mux_a_sel`. The exact serial order is:
+`input_mux_a_sel`. The exact serial order, after the start bit (§6.4), is:
 
-1. For each CSB from **column 6 down to column 0**: bits in descending index
+1. For each CSB from **column 7 down to column 0**: bits in descending index
    order — `couple_to_previous` (2), `bus_addr[1]` (1), `bus_addr[0]` (0).
-2. For each CLB from **(row 3, col 6) backwards along the raster to
-   (row 0, col 0)**: its 20 bits in descending index order — bit 19
+2. The IO controller's 64 bits in descending index order.
+3. For each CLB from **(row 3, col 7) backwards along the raster to
+   (row 0, col 0)**: its 25 bits in descending index order — bit 24
    (`op_ff_reset_val`) first, bit 0 (`input_mux_a_sel`) last.
 
-This is not a guess: both unit tests program exactly this way — `configure()`
-in `clb_unit_test.sv` shifts `config_val[19]` first, and
-`clock_bank_unit_test.sv`'s `test_config` shows the first-sent 3-bit group
-landing in CSB6 with its first bit at index 2.
+Both unit tests program exactly this way, and the RTL equivalence harness
+(`docs/rtl-equivalence.md`) programs the whole `SR_GA1` top level this way.
 
 ### 6.3 Total bit counts
 
-| Fabric | CLB bits | CSB bits | Total |
-|---|---|---|---|
-| 7 × 4 (current) | 28 × 20 = 560 | 7 × 3 = 21 | **581** |
-| 12 × 4 | 48 × 20 = 960 | 12 × 3 = 36 | 996 |
-| 16 × 4 | 64 × 20 = 1280 | 16 × 3 = 48 | 1328 |
+| Fabric | CLB bits | IO bits | CSB bits | Total |
+|---|---|---|---|---|
+| 8 × 4 (current) | 32 × 25 = 800 | 64 | 8 × 3 = 24 | **888** |
+| 12 × 4 | 48 × 25 = 1200 | 64 | 12 × 3 = 36 | 1300 |
+| 16 × 4 | 64 × 25 = 1600 | 64 | 16 × 3 = 48 | 1712 |
+
+A transmission is one bit longer: the start bit.
+
+### 6.4 Programming sequence and the freeze
+
+`SR_GA1` holds a `freeze_fabric` flop clocked by `shift_clk`: cleared
+asynchronously on the falling edge of `reset`, set by the first `shift_clk` edge
+that sees `shift_data_in` high while `reset` is high. While frozen, the chip
+outputs and DDIO outputs/directions are forced to 0, the vertical rings are
+gated to 0 at the top level, and the clock bank's wrap-around coupling is gated
+too — so nothing can oscillate through a loop while the chain shifts through
+arbitrary intermediate configurations.
+
+So a bitstream is sent as: hold `reset` high with `shift_data_in` low; shift
+**a start bit of 1** followed by the 888 configuration bits (the start bit sets
+the freeze and has been shifted out of the far end by the time the last bit is
+in); release `reset` to unfreeze. A synchronous design then asserts `reset`
+again and clocks its registers to load their reset values. Both tools prepend
+the start bit when exporting and require it when importing.
 
 ---
 
 ## 7. Findings that deviate from the prompt's expectations
 
-1. **No LUT.** Fixed 8-operation core with a 3-bit select (§1.1). The "truth
-   table / equation editor" in Phase 4 should instead be an operation picker
-   (showing the resulting truth table read-only is still possible).
+1. **A LUT after all.** Phase 0 found a fixed 8-operation core; the CLB has
+   since become a LUT3 (§1.1), and the inspector edits its truth table.
 2. **The carry chain is dedicated, not routed** (§1.4): one chain per column
    running upward, no wrap, reachable only through input mux c. Carry-out is
    not a bus source. (The RTL originally had no carry chain at all; it was
@@ -433,7 +466,7 @@ landing in CSB6 with its first bit at index 2.
    cycles (a vertical ring fed only by its own pass-throughs is a floating
    loop, a DRC case analogous to the CSB loop).
 8. **Nothing is ever electrically floating.** All-zero config drives `_op`
-   onto minor lanes and constant 0 onto major lanes. "`<unconnected>`" in the
+   (the constant-0 LUT) onto minor lanes and constant 0 onto major lanes. "`<unconnected>`" in the
    UI is a modelling notion (e.g. a lane fed by nothing meaningful /
    constant-0 default), not an electrical one.
 9. **Two modules named `CLB`** — `clb_blackbox.sv` is an STA stub; only
@@ -448,6 +481,6 @@ landing in CSB6 with its first bit at index 2.
 2. **`<unconnected>` semantics**: given nothing floats (finding 8), confirm
    that "unconnected" should mean "carrying only a default constant-0 from a
    major mux left at its default" vs. showing those as `fixed_zero`.
-3. **Row-3 constants**: lanes 0–3 of row 3 enter as 0/1/0/1. Should these
-   display as `fixed_zero`/`fixed_one` (shared with major-mux codes 0/1), or
-   as distinct reserved names?
+3. **Row-3 constants** (resolved, then made moot): row 3 entered as 0/1/0/1 and
+   displayed as `fixed_zero`/`fixed_one`. The configurable IO controller no
+   longer brings any constant in.

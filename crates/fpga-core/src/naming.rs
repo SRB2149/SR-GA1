@@ -14,7 +14,7 @@
 //! [`Namer`] at render time, which applies pinned names automatically.
 
 use crate::config::{default_name, BlockId, Design, IoPad};
-use crate::fabric::{BusOut, CarryChain, Fabric, Source};
+use crate::fabric::{BusOut, CarryChain, Fabric, IoSource, Source};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OutputKind {
@@ -26,10 +26,10 @@ pub enum OutputKind {
 /// Where the signal on a segment really comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NetOrigin {
-    /// Driven by the input controller at the left edge (reserved name).
-    Io { row: usize, lane: usize },
-    /// A constant selected by an output mux (or a row-3 IO constant, which
-    /// shares the reserved constant names via `Io`).
+    /// An input-side chip pad, read in at the left edge by the IO controller
+    /// (index into `Fabric::io_inputs`).
+    Io { pad: usize },
+    /// A constant selected by an output mux, or the carry chain's edge.
     Const(bool),
     /// A CLB output — a genuinely new net.
     ClbOutput { col: usize, row: usize, kind: OutputKind },
@@ -82,7 +82,8 @@ impl Netlist {
         self.horz[self.hidx(row, lane, col)]
     }
 
-    /// The horizontal segment entering the output controller on `row`/`lane`.
+    /// The horizontal segment leaving the fabric at the right edge on
+    /// `row`/`lane`, before the IO controller's output muxes.
     pub fn horz_edge(&self, row: usize, lane: usize) -> NetOrigin {
         self.horz[self.hidx(row, lane, self.columns)]
     }
@@ -217,7 +218,15 @@ impl<'a> Resolver<'a> {
         }
         self.horz[i] = Slot::Doing;
         let origin = if pos == 0 {
-            NetOrigin::Io { row, lane }
+            // The IO controller: a pad starts a net; an on-chip loop carries
+            // whatever net is leaving the right edge on the lane it reads.
+            match self.design.left_source(self.fabric, row, lane) {
+                IoSource::InPad(pad) => NetOrigin::Io { pad },
+                IoSource::OutPad(o) => {
+                    let (r, l) = self.design.pad_lane(self.fabric, o);
+                    self.horz_origin(r, l, self.fabric.columns)
+                }
+            }
         } else {
             let col = pos - 1;
             let mux = self.hmux[lane];
@@ -328,10 +337,10 @@ impl<'a> Namer<'a> {
             // pad *is* the net's name and every segment carrying it follows.
             // An output pad is different: the net arriving there is named after
             // whatever drives it, and the pad name is only a label on the pad.
-            NetOrigin::Io { row, lane } => self
+            NetOrigin::Io { pad } => self
                 .design
-                .effective_io_name(self.fabric, IoPad::input(row, lane))
-                .unwrap_or_else(|| self.fabric.io_inputs[row][lane].clone()),
+                .effective_io_name(self.fabric, IoPad::input(pad))
+                .unwrap_or_else(|| self.fabric.io_inputs[pad].clone()),
             NetOrigin::Const(false) => self.fabric.naming.constant_zero.clone(),
             NetOrigin::Const(true) => self.fabric.naming.constant_one.clone(),
             NetOrigin::ClbOutput { col, row, kind } => {

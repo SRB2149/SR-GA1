@@ -1,204 +1,204 @@
 {
-  "version": 1,
+  "version": 2,
   "fabric": {
     "name": "SR-GA1",
-    "columns": 7,
+    "columns": 8,
     "rows": 4,
-    "clb_bits": 20,
+    "clb_bits": 25,
+    "io_bits": 64,
     "csb_bits": 3
   },
   "name": "4-bit Adder",
   "clbs": {
     "0,0": {
-      "input_mux_a_sel": 1,
       "input_mux_c_sel": 3,
-      "major_horz2_sel": 3,
-      "major_horz3_sel": 3,
-      "minor_horz_sel": 1,
-      "minor_vert_sel": 1,
-      "operation_select": 2
+      "lut": 150
     },
     "0,1": {
-      "input_mux_b_sel": 1,
-      "major_horz2_sel": 3,
-      "major_horz3_sel": 3,
-      "minor_horz_sel": 3,
-      "operation_select": 6
+      "input_mux_c_sel": 3,
+      "lut": 150,
+      "major_horz2_sel": 4
     },
     "0,2": {
-      "input_mux_a_sel": 1,
-      "input_mux_b_sel": 1,
-      "input_mux_c_sel": 1,
-      "minor_horz_sel": 1,
-      "operation_select": 1
+      "input_mux_c_sel": 3,
+      "lut": 150,
+      "major_horz2_sel": 4
     },
     "0,3": {
-      "input_mux_b_sel": 1,
-      "input_mux_c_sel": 2,
-      "operation_select": 1
+      "input_mux_c_sel": 3,
+      "lut": 150
     },
     "1,0": {
-      "major_horz2_sel": 3,
-      "major_horz3_sel": 3,
       "minor_horz_sel": 1
     },
     "1,1": {
-      "input_mux_b_sel": 1,
-      "major_horz2_sel": 7,
-      "minor_horz_sel": 3,
-      "operation_select": 6
+      "major_horz2_sel": 3
     },
     "1,2": {
-      "input_mux_b_sel": 1,
-      "input_mux_c_sel": 1,
-      "major_horz3_sel": 6,
-      "operation_select": 1
+      "major_horz2_sel": 3
     },
     "1,3": {
-      "input_mux_b_sel": 1,
-      "input_mux_c_sel": 2,
-      "minor_horz_sel": 2,
-      "operation_select": 6
+      "minor_horz_sel": 1
     },
     "2,0": {
-      "input_mux_b_sel": 1,
-      "input_mux_c_sel": 1,
-      "major_horz2_sel": 3,
-      "major_horz3_sel": 3,
       "minor_horz_sel": 1
     },
     "2,1": {
-      "input_mux_a_sel": 1,
-      "input_mux_b_sel": 1,
-      "minor_horz_sel": 3,
-      "operation_select": 6
+      "major_horz2_sel": 3
     },
     "2,2": {
-      "input_mux_a_sel": 1,
-      "input_mux_b_sel": 1,
-      "input_mux_c_sel": 2,
-      "major_horz2_sel": 7,
-      "operation_select": 6
+      "major_horz2_sel": 3
     },
     "2,3": {
-      "input_mux_b_sel": 1,
-      "input_mux_c_sel": 1,
-      "minor_horz_sel": 3
+      "minor_horz_sel": 1
     },
     "3,0": {
-      "input_mux_b_sel": 1,
-      "input_mux_c_sel": 1,
-      "minor_vert_sel": 2,
-      "operation_select": 2
+      "minor_horz_sel": 1
     },
     "3,1": {
-      "input_mux_c_sel": 3,
-      "minor_vert_sel": 8,
-      "operation_select": 2
+      "major_horz2_sel": 3
     },
     "3,2": {
-      "input_mux_a_sel": 1,
-      "input_mux_b_sel": 1,
-      "input_mux_c_sel": 3,
-      "operation_select": 2
+      "major_horz2_sel": 3
     },
     "3,3": {
-      "input_mux_c_sel": 3,
-      "operation_select": 2
+      "minor_horz_sel": 1
+    },
+    "4,0": {
+      "minor_horz_sel": 1
+    },
+    "4,1": {
+      "major_horz2_sel": 3
+    },
+    "4,2": {
+      "major_horz2_sel": 3
+    },
+    "4,3": {
+      "minor_horz_sel": 1
+    },
+    "5,0": {
+      "minor_horz_sel": 1
+    },
+    "5,1": {
+      "major_horz2_sel": 3
+    },
+    "5,2": {
+      "major_horz2_sel": 3
+    },
+    "5,3": {
+      "minor_horz_sel": 1
+    },
+    "6,0": {
+      "minor_horz_sel": 1
+    },
+    "6,1": {
+      "major_horz2_sel": 3
+    },
+    "6,2": {
+      "major_horz2_sel": 3
+    },
+    "6,3": {
+      "minor_horz_sel": 1
+    },
+    "7,0": {
+      "minor_horz_sel": 1
+    },
+    "7,1": {
+      "major_horz2_sel": 3
+    },
+    "7,2": {
+      "major_horz2_sel": 3
+    },
+    "7,3": {
+      "minor_horz_sel": 1
     }
   },
-  "csbs": {
-    "0": {
-      "couple_to_previous": 1
-    },
-    "1": {
-      "couple_to_previous": 1
-    },
-    "2": {
-      "couple_to_previous": 1
-    },
-    "3": {
-      "couple_to_previous": 1
-    },
-    "4": {
-      "couple_to_previous": 1
-    },
-    "5": {
-      "couple_to_previous": 1
-    },
-    "6": {
-      "bus_addr": 3
-    }
+  "csbs": {},
+  "io": {
+    "input_mux_sel0b": 2,
+    "input_mux_sel1a": 7,
+    "input_mux_sel1b": 5,
+    "input_mux_sel2a": 4,
+    "input_mux_sel2b": 6,
+    "input_mux_sel3a": 3,
+    "input_mux_sel3b": 1,
+    "output_mux_sel0": 12,
+    "output_mux_sel_ddio_dir0": 2,
+    "output_mux_sel_ddio_dir1": 2
   },
   "pinned": {
-    "clb:0,2": "vroute9",
-    "clb:0,3": "hroute9",
-    "clb:1,1": "vroute6",
-    "clb:1,2": "v8h6route",
-    "clb:1,3": "hroute8",
-    "clb:2,1": "vroute7",
-    "clb:2,2": "hroute7",
-    "clb:3,0": "ADD0",
-    "clb:3,1": "ADD1",
-    "clb:3,2": "ADD2",
-    "clb:3,3": "ADD3"
+    "clb:0,0": "sum[0]",
+    "clb:0,1": "sum[1]",
+    "clb:0,2": "sum[2]",
+    "clb:0,3": "sum[3]"
   },
   "stimulus": {
-    "input_2": [
+    "input_0": [
       1,
-      1,
+      0,
+      0
+    ],
+    "input_1": [
+      0,
+      0,
       1
     ],
-    "input_3": [
-      1,
+    "input_2": [
+      0,
       1,
       0
     ],
-    "input_4": [
+    "input_3": [
       1,
+      0,
+      0
+    ],
+    "input_4": [
+      0,
       0,
       1
     ],
     "input_5": [
-      1,
       0,
+      1,
       0
     ],
     "input_6": [
       1,
-      1,
-      1
+      0,
+      0
     ],
     "input_7": [
-      1,
-      1,
+      0,
+      0,
       1
-    ],
-    "input_8": [
-      1,
-      0,
-      0
-    ],
-    "input_9": [
-      1,
-      0,
-      0
     ]
   },
   "tick": 5,
   "traces": [
     "op:3:0",
-    "op:3:1",
-    "op:3:2",
-    "op:3:3",
+    "in:input_0",
+    "in:input_1",
     "in:input_2",
     "in:input_3",
     "in:input_4",
     "in:input_5",
     "in:input_6",
-    "in:input_7",
-    "in:input_8",
-    "in:input_9"
+    "in:input_7"
   ],
-  "view": null
+  "view": null,
+  "io_names": {
+    "input_0": "a[0]",
+    "input_1": "b[3]",
+    "input_2": "b[0]",
+    "input_3": "a[3]",
+    "input_4": "b[2]",
+    "input_5": "a[1]",
+    "input_6": "a[2]",
+    "input_7": "b[1]",
+    "output_0": "sum[3]",
+    "output_1": "sum[0]",
+    "output_4": "sum[1]",
+    "output_6": "sum[2]"
+  }
 }

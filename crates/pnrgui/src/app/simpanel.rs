@@ -180,18 +180,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .small()
                 .color(egui::Color32::from_gray(120)),
         );
-        // Unique stimulus-driven input names, in fabric order.
-        let mut names: Vec<String> = Vec::new();
-        for row in &app.fabric.io_inputs {
-            for name in row {
-                if *name != app.fabric.naming.constant_zero
-                    && *name != app.fabric.naming.constant_one
-                    && !names.contains(name)
-                {
-                    names.push(name.clone());
-                }
-            }
-        }
+        // Every input-side pad takes stimulus, in fabric order.
+        let names: Vec<String> = app.fabric.io_inputs.clone();
         for name in names {
             // Read everything needing `&app` before taking the mutable buffer
             // borrow: the closure below relies on disjoint field capture, which
@@ -268,14 +258,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
 /// What a named input pin is actually carrying in the settled state.
 fn pin_value(app: &App, settled: &fpga_core::sim::Settled, name: &str) -> bool {
-    for row in 0..app.fabric.rows {
-        for lane in 0..app.fabric.horz_lanes {
-            if app.fabric.io_inputs[row][lane] == name {
-                return settled.horz_in(0, row, lane);
-            }
-        }
-    }
-    false
+    app.fabric.input_pad(name).is_some_and(|pad| settled.pad_in(pad))
 }
 
 fn trace_display_name(app: &App, id: &str) -> String {

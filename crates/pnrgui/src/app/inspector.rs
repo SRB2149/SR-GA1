@@ -1,5 +1,5 @@
-//! Inspectors: CLB (schematic-style input muxes, operation, FF, output
-//! muxes), CSB (clock source), IO controllers, and the config bit inspector.
+//! Inspectors: CLB (schematic-style input muxes, LUT, FF, output muxes), CSB
+//! (clock source), IO controller, and the config bit inspector.
 
 use super::{colors, App};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
@@ -13,7 +13,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         match app.selected {
             Some(BlockId::Clb { col, row }) => clb_inspector(app, ui, col, row),
             Some(BlockId::Csb { col }) => csb_inspector(app, ui, col),
-            None => {
+            Some(BlockId::Io) | None => {
                 if let Some((input_side, row)) = app.io_selected {
                     super::io_panel::show(app, ui, input_side, row);
                 }
@@ -117,38 +117,7 @@ fn clb_inspector(app: &mut App, ui: &mut egui::Ui, col: usize, row: usize) {
     input_mux_schematic(app, ui, col, row);
     ui.separator();
 
-    // Operation.
-    ui.label(egui::RichText::new("operation").strong());
-    let code = app.file.design.clb(col, row).slice(&app.fabric.op_select) as usize;
-    let mut chosen = code;
-    egui::ComboBox::from_id_salt(("op", col, row))
-        .selected_text(&app.fabric.operations[code].name)
-        .show_ui(ui, |ui| {
-            for (i, op) in app.fabric.operations.iter().enumerate() {
-                ui.selectable_value(&mut chosen, i, &op.name);
-            }
-        });
-    if chosen != code {
-        let slice = app.fabric.op_select;
-        app.set_slice_clb(col, row, slice, chosen as u64, "change operation");
-    }
-    let table = &app.fabric.operations[app.file.design.clb(col, row).slice(&app.fabric.op_select) as usize].table;
-    egui::CollapsingHeader::new("truth table")
-        .id_salt(("tt", col, row))
-        .show(ui, |ui| {
-            ui.monospace("c b a | out  carry");
-            for i in 0..table.len() {
-                let (a, b_, c) = (i & 1, (i >> 1) & 1, (i >> 2) & 1);
-                ui.monospace(format!(
-                    "{} {} {} |  {}     {}",
-                    c,
-                    b_,
-                    a,
-                    table[i] as u8,
-                    app.fabric.carry_table[i] as u8
-                ));
-            }
-        });
+    lut_editor(app, ui, col, row);
 
     // Flip-flop.
     ui.separator();
@@ -180,7 +149,7 @@ fn clb_inspector(app: &mut App, ui: &mut egui::Ui, col: usize, row: usize) {
         });
     }
     ui.label(
-        egui::RichText::new("carry-out leaves on the dedicated chain to the cell above; it is not routable onto the buses. Select carry-in on input c and XOR3 to make this cell a full adder.")
+        egui::RichText::new("carry-out leaves on the dedicated chain to the cell above; it is not routable onto the buses. Select carry-in on input c and the XOR3 LUT preset to make this cell a full adder.")
             .small()
             .color(Color32::from_gray(120)),
     );
@@ -223,6 +192,73 @@ fn clb_inspector(app: &mut App, ui: &mut egui::Ui, col: usize, row: usize) {
     });
 
     config_bits(app, ui, b);
+}
+
+/// The LUT: a preset picker and an editable truth table. Each output bit is a
+/// button; clicking it flips that bit. Rows are listed in index order, which
+/// puts the most significant input (`a`) in the leftmost column, as the RTL
+/// indexes `lut[{a, b, c}]`.
+fn lut_editor(app: &mut App, ui: &mut egui::Ui, col: usize, row: usize) {
+    ui.label(egui::RichText::new("lookup table").strong());
+    let field = app.fabric.lut.field;
+    let width = app.fabric.clb_fields[field].width;
+    let lut = app.file.design.clb(col, row).get(field);
+    let mut pick: Option<u64> = None;
+    ui.horizontal(|ui| {
+        let shown = app.fabric.preset_name(lut).unwrap_or("custom").to_string();
+        egui::ComboBox::from_id_salt(("lut", col, row))
+            .selected_text(shown)
+            .width(120.0)
+            .show_ui(ui, |ui| {
+                for (name, value) in &app.fabric.lut.presets {
+                    if ui.selectable_label(*value == lut, format!("{:6} 0x{:02X}", name, value)).clicked() {
+                        pick = Some(*value);
+                    }
+                }
+            });
+        ui.monospace(format!("0x{:02X}", lut));
+        let reads: Vec<&str> = (0..app.fabric.input_muxes.len())
+            .filter(|&k| fpga_core::drc::lut_depends_on(&app.fabric, lut, k))
+            .map(|k| app.fabric.input_muxes[k].name.as_str())
+            .collect();
+        ui.label(
+            egui::RichText::new(if reads.is_empty() {
+                "reads no input".to_string()
+            } else {
+                format!("reads {}", reads.join(", "))
+            })
+            .small()
+            .color(Color32::from_gray(120)),
+        );
+    });
+    egui::CollapsingHeader::new("truth table")
+        .id_salt(("tt", col, row))
+        .default_open(true)
+        .show(ui, |ui| {
+            let names: Vec<String> = app.fabric.lut.order.iter().map(|&m| app.fabric.input_muxes[m].name.clone()).collect();
+            ui.monospace(format!("{} | out  carry", names.join(" ")));
+            let n = names.len();
+            for i in 0..1usize << n {
+                let bits: Vec<String> = (0..n).rev().map(|b| ((i >> b) & 1).to_string()).collect();
+                let out = (lut >> i) & 1;
+                ui.horizontal(|ui| {
+                    ui.monospace(format!("{} |", bits.join(" ")));
+                    let button = egui::Button::new(
+                        egui::RichText::new(out.to_string()).monospace().color(colors::value_fill(out != 0)),
+                    )
+                    .min_size(Vec2::new(22.0, 0.0));
+                    if ui.add(button).on_hover_text("click to flip this output bit").clicked() {
+                        pick = Some(lut ^ (1 << i));
+                    }
+                    ui.monospace(format!("   {}", app.fabric.carry_table[i] as u8));
+                });
+            }
+        });
+    if let Some(v) = pick {
+        app.apply("change LUT", move |d, _| {
+            d.clb_mut(col, row).set(field, width, v);
+        });
+    }
 }
 
 /// The schematic: 4 input wires with the 3 muxes straddling adjacent pairs,
@@ -403,23 +439,21 @@ fn csb_inspector(app: &mut App, ui: &mut egui::Ui, col: usize) {
 
 // ---------------------------------------------------------------------------
 
-fn config_bits(app: &App, ui: &mut egui::Ui, b: BlockId) {
+pub(super) fn config_bits(app: &App, ui: &mut egui::Ui, b: BlockId) {
     egui::CollapsingHeader::new("config bits (bitstream positions)")
         .id_salt(("bits", b))
         .show(ui, |ui| {
             let fields = match b {
                 BlockId::Clb { .. } => &app.fabric.clb_fields,
                 BlockId::Csb { .. } => &app.fabric.csb_fields,
+                BlockId::Io => &app.fabric.io_fields,
             };
             let owned = bitstream::block_bits(&app.fabric, b);
-            ui.monospace("stream  field                bit  value");
+            ui.monospace("stream  field                     bit  value");
             for (stream, fi, bit) in owned {
-                let value = match b {
-                    BlockId::Clb { col, row } => app.file.design.clb(col, row).get(fi),
-                    BlockId::Csb { col } => app.file.design.csb(col).get(fi),
-                };
+                let value = app.file.design.block(b).get(fi);
                 ui.monospace(format!(
-                    "{:6}  {:20} {:3}  {}",
+                    "{:6}  {:25} {:3}  {}",
                     stream,
                     fields[fi].name,
                     bit,
@@ -427,7 +461,11 @@ fn config_bits(app: &App, ui: &mut egui::Ui, b: BlockId) {
                 ));
             }
             ui.label(
-                egui::RichText::new("stream = position in the exported bitstream (0 is transmitted first)")
+                egui::RichText::new(if app.fabric.start_bit.is_some() {
+                    "stream = position in the exported bitstream (0 is the start bit, transmitted first)"
+                } else {
+                    "stream = position in the exported bitstream (0 is transmitted first)"
+                })
                     .small()
                     .color(Color32::from_gray(120)),
             );

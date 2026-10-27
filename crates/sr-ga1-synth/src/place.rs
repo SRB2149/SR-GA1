@@ -1,19 +1,21 @@
 //! Pin assignment and placement, solved together.
 //!
-//! The IO positions are hard-wired — a given chip input arrives on exactly
-//! one row and one lane — so which pin a signal uses decides which row its
-//! consumers want to be in. That makes pin choice a variable in the same
-//! optimisation as placement rather than a formality, and the cost function
-//! below prices them against each other.
+//! Which lanes a pad reaches is IO controller configuration: a muxed pin can
+//! enter any row's lane 0 or 1, while a fixed one enters a single row's lane 2
+//! or 3, and the same holds in reverse for the outputs. Which pin a signal
+//! uses therefore still decides which rows its consumers want to be in, so
+//! pin choice is a variable in the same optimisation as placement, and the
+//! cost function below prices them against each other. The router makes the
+//! final lane choice.
 //!
 //! The cost model is shaped by one dominant fact: **horizontal lanes flow
 //! left to right and never turn.** A signal that has to reach a different
-//! row, or move leftward, must pass through a CLB's operation core onto a
-//! vertical ring, which costs a whole CLB. So a connection is nearly free if
-//! its driver sits in the same row and to the left of its consumer, and
-//! expensive otherwise. Everything else — lane-3 enables wanting row 3,
-//! constants wanting the major lanes, congestion per row — is a smaller
-//! correction on top.
+//! row, or move leftward, must either pass through a CLB's LUT onto a vertical
+//! ring, which costs a whole CLB, or leave on a chip output the IO controller
+//! reads back onto the left edge, which costs that output. So a connection is
+//! nearly free if its driver sits in the same row and to the left of its
+//! consumer, and expensive otherwise. Everything else — lane-3 enables needing
+//! an upstream CLB, congestion per row — is a smaller correction on top.
 //!
 //! Annealing runs are milliseconds at these sizes, so the search is many
 //! short runs from different seeds rather than one long one.
@@ -22,8 +24,7 @@ use crate::carry::CarryPlan;
 use crate::constraints::{Constraints, LoopbackPool};
 use crate::genlib::{CellLibrary, PhysIn};
 use crate::pack::{Enable, PackedDesign, Signal};
-use crate::rrg::Node;
-use crate::fabric::{Fabric, Source};
+use crate::fabric::{Fabric, IoSource, Source};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
@@ -152,6 +153,11 @@ impl Placement {
         // so the only choice is which one takes which input.
         if let (Some(link), Some(plan)) = (&packed.carry, target.carry) {
             let mut out = vec![Operand::DontCare; library.phys_inputs];
+            // A tap reads nothing but the chain.
+            if link.tap {
+                out[plan.carry_input] = Operand::CarryIn;
+                return out;
+            }
             let swap = placed.perm % 2 == 1;
             for (slot, &input) in plan.addend_inputs.iter().enumerate() {
                 let pin = if swap { 1 - slot } else { slot };
@@ -187,7 +193,6 @@ impl Placement {
                         .map(Operand::Signal)
                         .unwrap_or(Operand::DontCare)
                 }
-                PhysIn::Const(v) => Operand::Const(*v),
                 PhysIn::DontCare => Operand::DontCare,
             })
             .collect()
@@ -205,10 +210,11 @@ pub struct Target<'a> {
     /// Everything the user pinned down: pin locks, DDIO bindings, instance
     /// placement, clock assignment and the loop-around pool.
     pub constraints: &'a Constraints,
-    /// Input pad name -> (row, lane).
-    pub input_pads: Vec<(String, usize, usize)>,
-    /// Output pad name -> (row, lane).
-    pub output_pads: Vec<(String, usize, usize)>,
+    /// Assignable input pads, with the left-edge (row, lane)s each can reach.
+    pub input_pads: Vec<(String, Vec<(usize, usize)>)>,
+    /// Assignable output pads, with the right-edge (row, lane)s that can
+    /// drive each.
+    pub output_pads: Vec<(String, Vec<(usize, usize)>)>,
 }
 
 impl<'a> Target<'a> {
@@ -232,11 +238,7 @@ impl<'a> Target<'a> {
         // output and direction nets — and `ddio_dir` in particular steers a
         // pad rather than carrying a design signal, so handing an ordinary
         // output to it would silently reconfigure a pin.
-        let ddio: Vec<&str> = fabric
-            .ddio
-            .iter()
-            .flat_map(|d| [d.input.as_str(), d.output.as_str(), d.dir.as_str()])
-            .collect();
+        let ddio: Vec<&str> = fabric.ddio_pad_names();
 
         // An input pad in the loop-around pool is driven by a board wire, so a
         // design input cannot also use it. Output pads are different: a loop
@@ -254,30 +256,26 @@ impl<'a> Target<'a> {
         };
 
         let mut input_pads = Vec::new();
-        for (row, lanes) in fabric.io_inputs.iter().enumerate() {
-            for (lane, name) in lanes.iter().enumerate() {
-                // The reserved constant names are not assignable pins.
-                if *name == fabric.naming.constant_zero || *name == fabric.naming.constant_one {
-                    continue;
-                }
-                if unavailable(name) {
-                    continue;
-                }
-                input_pads.push((name.clone(), row, lane));
+        for (index, name) in fabric.io_inputs.iter().enumerate() {
+            if unavailable(name) {
+                continue;
             }
+            input_pads.push((name.clone(), input_lanes(fabric, index)));
         }
         let mut output_pads = Vec::new();
-        for (row, lanes) in fabric.io_outputs.iter().enumerate() {
-            for (lane, name) in lanes.iter().enumerate() {
-                if let Some(name) = name {
-                    if unavailable(name) {
-                        continue;
-                    }
-                    output_pads.push((name.clone(), row, lane));
-                }
+        for (index, name) in fabric.io_outputs.iter().enumerate() {
+            if unavailable(name) {
+                continue;
             }
+            output_pads.push((name.clone(), output_lanes(fabric, index)));
         }
         Target { fabric, library, carry, constraints, input_pads, output_pads }
+    }
+
+    /// Whether the IO controller can read any chip output back onto the left
+    /// edge.
+    pub fn has_on_chip_loops(&self) -> bool {
+        !self.fabric.loopable_outputs().is_empty()
     }
 
     /// Board wiring available as routing.
@@ -303,31 +301,18 @@ impl<'a> Target<'a> {
         })
     }
 
-    /// Where a pad physically is.
+    /// The left-edge (row, lane)s an input pad can reach.
     ///
     /// Resolved against the fabric, **not** against the assignable lists: a pad
     /// that a pin lock, a DDIO binding or the loop-around pool has claimed is
-    /// deliberately absent from those lists, but it still has a position and the
-    /// signal on it still has to be routed there.
-    pub fn input_pad(&self, name: &str) -> Option<(usize, usize)> {
-        for (row, lanes) in self.fabric.io_inputs.iter().enumerate() {
-            for (lane, pad) in lanes.iter().enumerate() {
-                if pad == name {
-                    return Some((row, lane));
-                }
-            }
-        }
-        None
+    /// deliberately absent from those lists, but the signal on it still has to
+    /// be routed from it.
+    pub fn input_pad(&self, name: &str) -> Option<Vec<(usize, usize)>> {
+        self.fabric.input_pad(name).map(|index| input_lanes(self.fabric, index))
     }
-    pub fn output_pad(&self, name: &str) -> Option<(usize, usize)> {
-        for (row, lanes) in self.fabric.io_outputs.iter().enumerate() {
-            for (lane, pad) in lanes.iter().enumerate() {
-                if pad.as_deref() == Some(name) {
-                    return Some((row, lane));
-                }
-            }
-        }
-        None
+    /// The right-edge (row, lane)s that can drive an output pad.
+    pub fn output_pad(&self, name: &str) -> Option<Vec<(usize, usize)>> {
+        self.fabric.output_pad(name).map(|index| output_lanes(self.fabric, index))
     }
 
     /// Horizontal lanes a given input mux can select.
@@ -344,17 +329,25 @@ impl<'a> Target<'a> {
 
     /// Whether a constant can be delivered to this input without spending a
     /// CLB on manufacturing one. See `Fabric::constant_reaches_input`.
-    pub fn input_reaches_constant(&self, mux: usize, col: usize, row: usize, value: bool) -> bool {
-        self.fabric.constant_reaches_input(mux, col, row, value)
+    pub fn input_reaches_constant(&self, mux: usize, col: usize, value: bool) -> bool {
+        self.fabric.constant_reaches_input(mux, col, value)
     }
 }
+
+fn input_lanes(fabric: &Fabric, pad: usize) -> Vec<(usize, usize)> {
+    fabric.lanes_for_source(IoSource::InPad(pad)).iter().map(|l| (l.row, l.lane)).collect()
+}
+
+fn output_lanes(fabric: &Fabric, pad: usize) -> Vec<(usize, usize)> {
+    fabric.lanes_for_output(pad).iter().map(|l| (l.row, l.lane)).collect()
+}
+
+/// A pad and the edge (row, lane)s it can reach.
+type PadLanes = (String, Vec<(usize, usize)>);
 
 /// How much a connection that cannot run straight along a row costs, in the
 /// same units as a lane hop. One vertical detour spends a CLB.
 const HOP: f64 = 30.0;
-/// An unconditional register outside the row whose lane 3 enters as a
-/// constant 1 needs an upstream CLB to drive its enable.
-const ENABLE_OFF_FREE_ROW: f64 = 12.0;
 /// A constant the input mux cannot reach from a major lane.
 const UNREACHABLE_CONSTANT: f64 = 40.0;
 /// A connection the fabric simply cannot make from where the cell has been
@@ -363,14 +356,15 @@ const INFEASIBLE: f64 = 400.0;
 /// What a loop-around wire costs: no CLB, but a scarce input pad and a physical
 /// connection that has to exist. Matches `route::edge_base`.
 const LOOPBACK: f64 = 20.0;
+/// What an on-chip loop costs: no CLB and no wiring, but one of a few chip
+/// outputs the IO controller can read back. Matches `route::edge_base`.
+const ON_CHIP_LOOP: f64 = 12.0;
 
 pub struct Placer<'a> {
     design: &'a PackedDesign,
     target: &'a Target<'a>,
     /// Lane that gates the flip-flop.
     enable_lane: Option<usize>,
-    /// Row whose enable segment enters as a constant 1, if any.
-    free_enable_row: Option<usize>,
 }
 
 impl<'a> Placer<'a> {
@@ -379,30 +373,17 @@ impl<'a> Placer<'a> {
             Source::HorzIn(lane) => Some(lane),
             _ => None,
         };
-        let free_enable_row = enable_lane.and_then(|lane| {
-            (0..target.fabric.rows).find(|&row| target.fabric.io_constant(row, lane) == Some(true))
-        });
-        Placer { design, target, enable_lane, free_enable_row }
+        Placer { design, target, enable_lane }
     }
 
     /// Whether a register placed here can be held enabled at all.
     ///
     /// The enable is a segment like any other, so the constant 1 it needs comes
-    /// either from the IO map at the left edge or from an upstream CLB's major
-    /// mux — and at column 0 there is no upstream CLB. A register in column 0
-    /// outside the free-enable row simply cannot capture.
-    fn enable_reachable(&self, col: usize, row: usize) -> bool {
+    /// from an upstream CLB's major mux — and at column 0 there is no upstream
+    /// CLB, only a chip input. A register there simply cannot capture.
+    fn enable_reachable(&self, col: usize, _row: usize) -> bool {
         let Some(lane) = self.enable_lane else { return false };
-        if self.target.fabric.io_constant(row, lane) == Some(true) {
-            return true;
-        }
-        self.target.fabric.const_capable_horz_lanes().contains(&lane) && col > 0
-    }
-
-    /// The row whose registers capture for free, reported so the caller can
-    /// explain the placement.
-    pub fn free_enable_row(&self) -> Option<usize> {
-        self.free_enable_row
+        self.target.fabric.constant_reaches_lane(lane, col)
     }
 
     /// Anneal from one seed. Returns the best placement found.
@@ -457,28 +438,37 @@ impl<'a> Placer<'a> {
             }
         }
 
-        // Carry chains next, because they are the only other cells with no
-        // freedom of their own: a chain occupies consecutive ascending rows of
-        // a single column, starting at the row whose carry input is tied off.
-        let lsb_row = self.target.carry.map(|p| p.lsb_row).unwrap_or(0);
-        for chain in &self.design.chains {
+        // Carry chains next, because they are the only other cells with so
+        // little freedom: a chain occupies consecutive ascending rows of a
+        // single column, starting at the row whose carry input is tied off —
+        // or, when its first bit takes its carry-in on a lane, on any row it
+        // fits from.
+        for (chain_index, chain) in self.design.chains.iter().enumerate() {
             // A lock on any member fixes the whole chain's column, since a
             // chain cannot straddle columns.
             let locked_column = chain.iter().find_map(|&cell| {
                 self.locked_position(cell).map(|(col, _)| col)
             });
+            let bases = self.chain_bases(chain_index);
+            let fits = |col: usize, base: usize| {
+                (0..chain.len()).all(|i| base + i < fabric.rows && !taken[slot_of(col, base + i)])
+            };
             let start = rng.below(fabric.columns.max(1));
-            let column = locked_column.unwrap_or_else(|| {
-                (0..fabric.columns)
-                    .map(|k| (start + k) % fabric.columns)
-                    .find(|&col| {
-                        (0..chain.len())
-                            .all(|i| lsb_row + i < fabric.rows && !taken[slot_of(col, lsb_row + i)])
-                    })
-                    .unwrap_or(0)
-            });
+            let first_base = rng.below(bases.len());
+            let mut choice = None;
+            'search: for k in 0..fabric.columns {
+                let col = locked_column.unwrap_or((start + k) % fabric.columns);
+                for b in 0..bases.len() {
+                    let base = bases[(first_base + b) % bases.len()];
+                    if fits(col, base) {
+                        choice = Some((col, base));
+                        break 'search;
+                    }
+                }
+            }
+            let (column, base) = choice.unwrap_or((locked_column.unwrap_or(0), bases[0]));
             for (index, &cell) in chain.iter().enumerate() {
-                let row = (lsb_row + index).min(fabric.rows - 1);
+                let row = (base + index).min(fabric.rows - 1);
                 taken[slot_of(column, row)] = true;
                 cells[cell] = Some(Placed { col: column, row, imp: 0, perm: 0 });
             }
@@ -497,14 +487,13 @@ impl<'a> Placer<'a> {
             if cells[index].is_some() {
                 continue;
             }
-            // Prefer the free-enable row for unconditional registers.
-            let wants_row = match (&packed.reg, self.free_enable_row) {
-                (Some(r), Some(row)) if r.enable == Enable::Always => Some(row),
-                _ => None,
+            // An unconditional register cannot be enabled in column 0.
+            let pick = match &packed.reg {
+                Some(r) if r.enable == Enable::Always => {
+                    free.iter().position(|&(col, row)| self.enable_reachable(col, row)).unwrap_or(0)
+                }
+                _ => 0,
             };
-            let pick = wants_row
-                .and_then(|row| free.iter().position(|&(_, r)| r == row))
-                .unwrap_or(0);
             let (col, row) = if free.is_empty() { (0, 0) } else { free.remove(pick) };
             cells[index] = Some(Placed { col, row, imp: 0, perm: 0 });
         }
@@ -578,31 +567,56 @@ impl<'a> Placer<'a> {
         self.design.cells[cell].carry.as_ref().map(|link| link.chain)
     }
 
-    /// Slide a whole chain to another column, keeping each cell's row. Returns
-    /// false if that column cannot hold it.
-    fn move_chain(&self, state: &mut Placement, chain: usize, column: usize) -> bool {
+    /// The rows a chain's least significant bit may sit in. A chain fed from
+    /// the tied-off edge must start at the edge row; one whose first bit takes
+    /// its carry-in on a lane — a later segment of a wide adder, or an adder
+    /// with a carry-in port — may start wherever it fits.
+    fn chain_bases(&self, chain: usize) -> Vec<usize> {
+        let members = &self.design.chains[chain];
+        let lsb_row = self.target.carry.map(|p| p.lsb_row).unwrap_or(0);
+        let routed_in = members
+            .first()
+            .and_then(|&c| self.design.cells[c].carry.as_ref())
+            .is_some_and(|link| link.carry_in.is_some());
+        let rows = self.target.fabric.rows;
+        if routed_in && members.len() <= rows {
+            (0..=rows - members.len()).collect()
+        } else {
+            vec![lsb_row]
+        }
+    }
+
+    /// Slide a whole chain to another column and base row. Returns false if
+    /// that position cannot hold it.
+    fn move_chain(&self, state: &mut Placement, chain: usize, column: usize, base: usize) -> bool {
         let members = &self.design.chains[chain];
         // A pinned member pins the column for all of them.
         if members.iter().any(|&cell| self.locked_position(cell).is_some()) {
             return false;
         }
-        for &cell in members {
-            let row = state.cells[cell].row;
-            if let Some(occupant) = state.cell_at(column, row) {
-                if occupant != cell && self.chain_of(occupant) != Some(chain) {
+        if base + members.len() > self.target.fabric.rows {
+            return false;
+        }
+        for (index, _) in members.iter().enumerate() {
+            if let Some(occupant) = state.cell_at(column, base + index) {
+                if self.chain_of(occupant) != Some(chain) {
                     return false;
                 }
             }
         }
-        for &cell in members {
+        for (index, &cell) in members.iter().enumerate() {
             state.cells[cell].col = column;
+            state.cells[cell].row = base + index;
         }
         true
     }
 
-    /// Give every design port a pad, preferring one in the row where its
-    /// traffic already is. Pads are taken greedily in a fixed order, so the
-    /// result is deterministic.
+    /// Give every design port a pad, preferring one that reaches the row where
+    /// its traffic already is. Among those, a fixed pin beats a muxed one: a
+    /// muxed input spends one of the left edge's few input mux lanes, and a
+    /// muxed output is one of the few the IO controller can read back, both of
+    /// which on-chip loops need. Pads are taken greedily in a fixed order, so
+    /// the result is deterministic.
     fn assign_pins(&self, placement: &mut Placement) {
         let mut taken: Vec<String> = Vec::new();
         for port in &self.design.inputs {
@@ -627,12 +641,9 @@ impl<'a> Placer<'a> {
                 .target
                 .input_pads
                 .iter()
-                .filter(|(name, _, _)| !taken.contains(name))
-                .min_by_key(|(_, row, lane)| {
-                    let row_miss = wanted_row.map(|w| w.abs_diff(*row)).unwrap_or(0);
-                    (row_miss, *lane)
-                })
-                .map(|(name, _, _)| name.clone());
+                .filter(|(name, _)| !taken.contains(name))
+                .min_by_key(|(_, lanes)| (row_miss(lanes, wanted_row), lanes.len()))
+                .map(|(name, _)| name.clone());
             if let Some(pad) = pad {
                 taken.push(pad.clone());
                 placement.input_pins.insert(port.net, pad);
@@ -655,12 +666,9 @@ impl<'a> Placer<'a> {
                 .target
                 .output_pads
                 .iter()
-                .filter(|(name, _, _)| !taken_out.contains(name))
-                .min_by_key(|(_, row, lane)| {
-                    let row_miss = driver_row.map(|w| w.abs_diff(*row)).unwrap_or(0);
-                    (row_miss, *lane)
-                })
-                .map(|(name, _, _)| name.clone());
+                .filter(|(name, _)| !taken_out.contains(name))
+                .min_by_key(|(_, lanes)| (row_miss(lanes, driver_row), lanes.len()))
+                .map(|(name, _)| name.clone());
             if let Some(pad) = pad {
                 taken_out.push(pad.clone());
                 placement.output_pins.insert(port.net, pad);
@@ -688,7 +696,9 @@ impl<'a> Placer<'a> {
                         .map(|&c| state.cells[c].clone())
                         .collect();
                     let column = rng.below(fabric.columns);
-                    if !self.move_chain(state, chain, column) {
+                    let bases = self.chain_bases(chain);
+                    let base = bases[rng.below(bases.len())];
+                    if !self.move_chain(state, chain, column, base) {
                         return None;
                     }
                     return Some(Undo::Chain(chain, before));
@@ -735,10 +745,10 @@ impl<'a> Placer<'a> {
                 Some(Undo::Cell(cell, before))
             }
             // Reassign a chip pin. Pin choice is a real variable here, not a
-            // formality: the IO positions are fixed, so which pad a signal
-            // takes decides which row its consumers want to sit in. A greedy
-            // first pass will happily give a row-2 pad to a signal whose
-            // consumer is in row 3 and strand the signal that needed it.
+            // formality: a fixed pin enters one row's lane 2 or 3 and a muxed
+            // one competes for the few input mux lanes, so which pad a signal
+            // takes decides where its consumers want to sit. A greedy first
+            // pass will happily strand a signal that needed the pad it took.
             9..=12 => {
                 let inputs = !state.input_pins.is_empty();
                 let outputs = !state.output_pins.is_empty();
@@ -747,7 +757,7 @@ impl<'a> Placer<'a> {
                 }
                 let before = (state.input_pins.clone(), state.output_pins.clone());
                 let do_inputs = inputs && (!outputs || rng.below(4) != 0);
-                let (pins, pads): (&mut BTreeMap<u32, String>, &[(String, usize, usize)]) =
+                let (pins, pads): (&mut BTreeMap<u32, String>, &[PadLanes]) =
                     if do_inputs {
                         (&mut state.input_pins, &self.target.input_pads)
                     } else {
@@ -801,8 +811,9 @@ impl<'a> Placer<'a> {
     pub fn cost(&self, state: &Placement) -> f64 {
         let mut total = 0.0;
 
-        // Where each net is driven from.
+        // Where each net is driven from, and which nets leave a register.
         let mut driver: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+        let mut registered: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
         for (index, cell) in self.design.cells.iter().enumerate() {
             let placed = &state.cells[index];
             if let Some(net) = cell.op {
@@ -810,15 +821,17 @@ impl<'a> Placer<'a> {
             }
             if let Some(reg) = &cell.reg {
                 driver.insert(reg.q, (placed.col, placed.row));
+                registered.insert(reg.q);
             }
         }
-        // Chip inputs are driven at the left edge of their pad's row.
-        let mut pad_row: BTreeMap<u32, usize> = BTreeMap::new();
+        // Chip inputs enter at the left-edge lanes their pad reaches.
+        let mut pad_row: BTreeMap<u32, Vec<(usize, usize)>> = BTreeMap::new();
         for (net, pad) in &state.input_pins {
-            if let Some((row, _)) = self.target.input_pad(pad) {
-                pad_row.insert(*net, row);
+            if let Some(lanes) = self.target.input_pad(pad) {
+                pad_row.insert(*net, lanes);
             }
         }
+        let sources = Sources { driver: &driver, pads: &pad_row, registered: &registered };
 
         for (index, cell) in self.design.cells.iter().enumerate() {
             let placed = &state.cells[index];
@@ -830,8 +843,8 @@ impl<'a> Placer<'a> {
                         total += self.connection_cost(
                             *net,
                             placed,
-                            &driver,
-                            &pad_row,
+                            &sources,
+                            &self.target.lanes_of_input(mux),
                             self.input_reaches_major(mux),
                         );
                         // An operand can only arrive on a lane this mux sees;
@@ -840,7 +853,7 @@ impl<'a> Placer<'a> {
                         total += 1.0 / window.max(1.0);
                     }
                     Operand::Signal(Signal::Const(v)) | Operand::Const(v) => {
-                        if self.target.input_reaches_constant(mux, placed.col, placed.row, *v) {
+                        if self.target.input_reaches_constant(mux, placed.col, *v) {
                             total += 0.5;
                         } else {
                             total += UNREACHABLE_CONSTANT;
@@ -856,25 +869,25 @@ impl<'a> Placer<'a> {
                     Enable::Always => {
                         if !self.enable_reachable(placed.col, placed.row) {
                             total += INFEASIBLE;
-                        } else if Some(placed.row) != self.free_enable_row {
-                            total += ENABLE_OFF_FREE_ROW;
                         }
                     }
                     Enable::Net(net) => {
                         // The enable is a major lane, which a vertical bridge
                         // reaches directly.
-                        total += self.connection_cost(*net, placed, &driver, &pad_row, true);
+                        let lanes: Vec<usize> = self.enable_lane.into_iter().collect();
+                        total += self.connection_cost(*net, placed, &sources, &lanes, true);
                     }
                 }
             }
         }
 
-        // Design outputs must leave on their pad's row, at its lane.
+        // Design outputs must leave on a row their pad can read.
         for (net, pad) in &state.output_pins {
-            let Some((pad_row, _)) = self.target.output_pad(pad) else { continue };
+            let Some(lanes) = self.target.output_pad(pad) else { continue };
             let Some(&(_, driver_row)) = driver.get(net) else { continue };
-            if pad_row != driver_row {
-                total += HOP + pad_row.abs_diff(driver_row) as f64;
+            let miss = row_miss(&lanes, Some(driver_row));
+            if miss > 0 {
+                total += HOP + miss as f64;
             }
         }
 
@@ -909,19 +922,21 @@ impl<'a> Placer<'a> {
         &self,
         net: u32,
         sink: &Placed,
-        driver: &BTreeMap<u32, (usize, usize)>,
-        pad_row: &BTreeMap<u32, usize>,
+        sources: &Sources,
+        // The horizontal lanes the destination can read.
+        sees: &[usize],
         // Whether the destination can be reached by a signal arriving from
         // another row: such a signal comes back onto the horizontal buses
         // through a major mux, so it lands only on a major lane.
         reaches_major: bool,
     ) -> f64 {
+        let (driver, pad_row) = (sources.driver, sources.pads);
+        let major = self.target.fabric.const_capable_horz_lanes();
+        let sees_major = sees.iter().any(|l| major.contains(l));
         // Column 0's incoming segments are driven by the IO controller and by
-        // nothing else, so a cell there can only be fed by the pad entering on
-        // its own row. No amount of routing changes that.
-        let unfeedable_at_edge = |source_row: Option<usize>| {
-            sink.col == 0 && source_row != Some(sink.row)
-        };
+        // nothing else, so a cell there can only be fed by a pad reaching its
+        // own row, or by an output the controller reads back.
+        let on_chip = self.target.has_on_chip_loops();
         // An input that cannot see a major lane needs a further CLB to move a
         // cross-row signal onto its minor lane.
         let cross_row_extra = if reaches_major { 0.0 } else { HOP };
@@ -930,37 +945,58 @@ impl<'a> Placer<'a> {
         // to bring it back onto a horizontal lane. A destination hard against
         // the left edge has nowhere to do that, and the only ring it can reach
         // is the one column whose CLBs are also the row's pass-throughs — which
-        // is how several nets end up fighting over a single operation core.
+        // is how several nets end up fighting over a single LUT.
         let staging = sink.col as f64;
         let mut staging_extra = (2.0 - staging).max(0.0) * HOP;
         let mut cross_row = HOP + cross_row_extra;
-        // A loop-around wire crosses rows and moves leftward for the price of an
-        // input pad and no CLB at all, so once the board has some, the placer
-        // should stop contorting itself to avoid what is now cheap.
+        // A loop back to the left edge crosses rows and moves leftward for the
+        // price of a pad and no CLB at all, so where one is available the
+        // placer should stop contorting itself to avoid what is now cheap.
+        if on_chip {
+            cross_row = cross_row.min(ON_CHIP_LOOP);
+            staging_extra = staging_extra.min(ON_CHIP_LOOP);
+        }
         if !self.target.loopback().is_empty() {
             cross_row = cross_row.min(LOOPBACK);
             staging_extra = staging_extra.min(LOOPBACK);
         }
 
         if let Some(&(col, row)) = driver.get(&net) {
-            if unfeedable_at_edge(None) {
-                return INFEASIBLE;
+            if sink.col == 0 {
+                // Only a loop back through the IO controller reaches column 0.
+                return if on_chip { ON_CHIP_LOOP + row.abs_diff(sink.row) as f64 } else { INFEASIBLE };
             }
             if row == sink.row && col < sink.col {
-                // Straight along the row: the cheap case.
-                (sink.col - col) as f64 * 0.25
+                // Straight along the row: the cheap case — unless it leaves a
+                // register, which only the major lanes carry, and the
+                // destination cannot read one.
+                let along = (sink.col - col) as f64 * 0.25;
+                if sources.registered.contains(&net) && !sees_major {
+                    along + HOP
+                } else {
+                    along
+                }
             } else {
-                // Anything else needs a vertical detour through a CLB.
+                // Anything else needs a vertical detour or a loop.
                 cross_row + staging_extra + row.abs_diff(sink.row) as f64
             }
-        } else if let Some(&row) = pad_row.get(&net) {
-            if unfeedable_at_edge(Some(row)) {
-                return INFEASIBLE;
-            }
-            if row == sink.row {
+        } else if let Some(lanes) = pad_row.get(&net) {
+            // A pad enters on particular lanes, and a minor lane never changes:
+            // the destination must see one of them, or reach it by a major
+            // mux crossing over on the way.
+            let here: Vec<usize> =
+                lanes.iter().filter(|&&(r, _)| r == sink.row).map(|&(_, l)| l).collect();
+            if here.iter().any(|l| sees.contains(l)) {
                 sink.col as f64 * 0.25
+            } else if sink.col > 0 && sees_major && here.iter().any(|l| major.contains(l)) {
+                sink.col as f64 * 0.25 + 1.0
+            } else if sink.col == 0 {
+                INFEASIBLE
+            } else if !here.is_empty() {
+                HOP
             } else {
-                cross_row + staging_extra + row.abs_diff(sink.row) as f64
+                let miss = lanes.iter().map(|&(r, _)| r.abs_diff(sink.row)).min().unwrap_or(0);
+                cross_row + staging_extra + miss as f64
             }
         } else {
             // Not driven by anything placed: a constant or an unused net.
@@ -1014,25 +1050,16 @@ impl<'a> Placer<'a> {
     /// What each clock's column choice costs.
     ///
     /// A clock has to be driven onto its column's vertical ring, and the only
-    /// horizontal-to-vertical path is through a CLB's operation core. So the
-    /// chosen column needs a free CLB in the clock's own row that can also
-    /// neutralise its idle inputs — which at column 0 it generally cannot,
-    /// there being no upstream CLB to supply a constant.
-    fn clock_cost(&self, state: &Placement, pad_row: &BTreeMap<u32, usize>) -> f64 {
+    /// horizontal-to-vertical path is through a CLB's LUT. So the chosen column
+    /// needs a free CLB in a row the clock's pad reaches.
+    fn clock_cost(&self, state: &Placement, pad_row: &BTreeMap<u32, Vec<(usize, usize)>>) -> f64 {
         let mut total = 0.0;
         for clock in &self.design.clocks {
             let Some(&column) = state.clock_columns.get(clock) else { continue };
-            let Some(&row) = pad_row.get(clock) else { continue };
-            // The buffer that puts the clock on the ring lands here.
-            if state.cell_at(column, row).is_some() {
+            let Some(lanes) = pad_row.get(clock) else { continue };
+            // The buffer that puts the clock on the ring lands in one of these.
+            if lanes.iter().all(|&(row, _)| state.cell_at(column, row).is_some()) {
                 total += HOP;
-            }
-            let can_neutralise = (0..self.target.fabric.input_muxes.len())
-                .any(|mux| self.target.input_reaches_constant(mux, column, row, false))
-                || (0..self.target.fabric.input_muxes.len())
-                    .any(|mux| self.target.input_reaches_constant(mux, column, row, true));
-            if !can_neutralise {
-                total += INFEASIBLE;
             }
         }
         total
@@ -1042,20 +1069,32 @@ impl<'a> Placer<'a> {
     /// a safety net rather than a gradient: if the invariant is ever broken,
     /// the cost says so loudly instead of the router failing obscurely.
     fn chain_penalty(&self, state: &Placement) -> f64 {
-        let Some(plan) = self.target.carry else { return 0.0 };
+        if self.target.carry.is_none() {
+            return 0.0;
+        }
         let mut total = 0.0;
-        for chain in &self.design.chains {
+        for (chain_index, chain) in self.design.chains.iter().enumerate() {
             let Some(&first) = chain.first() else { continue };
-            let column = state.cells[first].col;
+            let (column, base) = (state.cells[first].col, state.cells[first].row);
+            if !self.chain_bases(chain_index).contains(&base) {
+                total += INFEASIBLE;
+            }
             for (index, &cell) in chain.iter().enumerate() {
                 let placed = &state.cells[cell];
-                if placed.col != column || placed.row != plan.lsb_row + index {
+                if placed.col != column || placed.row != base + index {
                     total += INFEASIBLE;
                 }
             }
         }
         total
     }
+}
+
+/// Where each net comes from, for the connection cost.
+struct Sources<'s> {
+    driver: &'s BTreeMap<u32, (usize, usize)>,
+    pads: &'s BTreeMap<u32, Vec<(usize, usize)>>,
+    registered: &'s std::collections::BTreeSet<u32>,
 }
 
 enum Undo {
@@ -1089,7 +1128,10 @@ impl Undo {
     }
 }
 
-/// Node a design output must be driven onto.
-pub fn output_node(fabric: &Fabric, row: usize, lane: usize) -> Node {
-    Node::HSeg { row, col: fabric.columns, lane }
+/// How far the nearest of a pad's rows is from the row wanted.
+fn row_miss(lanes: &[(usize, usize)], wanted: Option<usize>) -> usize {
+    match wanted {
+        Some(w) => lanes.iter().map(|&(row, _)| row.abs_diff(w)).min().unwrap_or(usize::MAX),
+        None => 0,
+    }
 }

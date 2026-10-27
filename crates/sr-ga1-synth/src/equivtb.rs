@@ -142,15 +142,9 @@ impl PortMap {
     }
 }
 
-/// Assignable chip input pads, excluding the reserved constants.
+/// Every input-side pad, which the configured model takes as a port.
 fn pads(fabric: &Fabric) -> Vec<String> {
-    fabric
-        .io_inputs
-        .iter()
-        .flatten()
-        .filter(|n| **n != fabric.naming.constant_zero && **n != fabric.naming.constant_one)
-        .cloned()
-        .collect()
+    fabric.io_inputs.clone()
 }
 
 pub fn testbench(
@@ -163,8 +157,7 @@ pub fn testbench(
     let fabric = &outcome.fabric;
     let top = &outcome.packed.top;
     let input_pads = pads(fabric);
-    let output_pads: Vec<String> =
-        fabric.io_outputs.iter().flatten().flatten().cloned().collect();
+    let output_pads: Vec<String> = fabric.io_outputs.clone();
 
     let mut o = String::new();
     let w = &mut o;

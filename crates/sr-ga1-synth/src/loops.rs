@@ -2,9 +2,15 @@
 //!
 //! This is not advisory. `vert_in[0]` feeds input mux `c`, and vertical lane 0
 //! carries `_op`, so a CLB that drives its own `_op` onto the ring and reads
-//! `vert_in[0]` closes a combinational loop through its own operation core.
-//! Roughly nine in ten randomly configured fabrics contain one. Nothing this
-//! tool emits may.
+//! `vert_in[0]` closes a combinational loop through its own LUT. The IO
+//! controller adds more ways round: a chip output read back onto the left
+//! edge, and a DDIO pad in output mode reading its own output. Roughly nine in
+//! ten randomly configured fabrics contain a loop. Nothing this tool emits may.
+//!
+//! A LUT only passes on the inputs its truth table reads, so an input it
+//! ignores — a buffer's two idle inputs, say — is not an edge here. That is
+//! what keeps don't-care inputs left at their default select from closing a
+//! cycle that no signal could ever travel.
 //!
 //! The check runs on the *final* configuration rather than on the routing, so
 //! it also catches loops created by CLBs nobody routed through — the default
@@ -19,7 +25,7 @@
 //! easiest way to ship a design that does not work.
 
 use crate::design::Design;
-use crate::fabric::{BusOut, Fabric, FieldSlice, Source};
+use crate::fabric::{BusOut, Fabric, FieldSlice, IoSource, Source};
 use crate::rrg::Node;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -46,6 +52,38 @@ fn select(config: &Design, col: usize, row: usize, slice: FieldSlice) -> u64 {
     }
 }
 
+/// Whether a LUT value's output changes with input mux `k`.
+pub fn lut_depends_on(fabric: &Fabric, lut: u64, k: usize) -> bool {
+    let n = fabric.input_muxes.len();
+    (0..1usize << n).any(|minterm| {
+        let mut values: Vec<bool> = (0..n).map(|b| minterm >> b & 1 != 0).collect();
+        let before = fabric.eval_lut(lut, &values);
+        values[k] = !values[k];
+        before != fabric.eval_lut(lut, &values)
+    })
+}
+
+/// The constant a right-edge lane is known to carry, found by following
+/// pass-throughs back to a constant select or an all-zero LUT.
+fn right_edge_constant(fabric: &Fabric, config: &Design, row: usize, lane: usize) -> Option<bool> {
+    let (mut col, mut lane) = (fabric.columns, lane);
+    while col > 0 {
+        let cell = col - 1;
+        let mux = fabric.output_mux(BusOut::Horz(lane))?;
+        let code = select(config, cell, row, mux.select) as usize;
+        match *mux.sources.get(code)? {
+            Source::Const(v) => return Some(v),
+            Source::Op if config.clb(cell, row).get(fabric.lut.select.field) == 0 => return Some(false),
+            Source::HorzIn(k) => {
+                lane = k;
+                col = cell;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Build the realised combinational graph: what each mux is actually selecting.
 ///
 /// The flip-flop is deliberately absent. `_op -> _reg` is the only edge that
@@ -62,6 +100,32 @@ fn combinational_edges(
     // Board wiring: a chip output feeding a chip input, combinational.
     for &(source, sink) in loopbacks {
         add(source, sink);
+    }
+
+    // The IO controller: the right-edge lane each output-side pad reads, and
+    // what each left-edge lane reads — a pad, or an output read back on-chip.
+    for pad in 0..fabric.io_outputs.len() {
+        let (row, lane) = config.pad_lane(fabric, pad);
+        add(Node::HSeg { row, col: fabric.columns, lane }, Node::OutPad(pad));
+    }
+    for row in 0..fabric.rows {
+        for lane in 0..fabric.horz_lanes {
+            let from = match config.left_source(fabric, row, lane) {
+                IoSource::InPad(pad) => Node::InPad(pad),
+                IoSource::OutPad(pad) => Node::OutPad(pad),
+            };
+            add(from, Node::HSeg { row, col: 0, lane });
+        }
+    }
+    // A DDIO pad in output mode reads its own output back, gated by its
+    // direction. Only a direction held at a constant 0 rules that out.
+    for d in &fabric.ddio {
+        let (row, lane) = config.pad_lane(fabric, d.dir);
+        if right_edge_constant(fabric, config, row, lane) == Some(false) {
+            continue;
+        }
+        add(Node::OutPad(d.dir), Node::InPad(d.input));
+        add(Node::OutPad(d.output), Node::InPad(d.input));
     }
 
     for col in 0..fabric.columns {
@@ -88,8 +152,9 @@ fn combinational_edges(
                 add(from, target);
             }
 
-            // Input muxes, then the operation core and the carry adder, both
-            // of which are combinational.
+            // Input muxes, then the LUT and the carry adder, both of which
+            // are combinational. The LUT passes on only the inputs it reads.
+            let lut = config.clb(col, row).get(fabric.lut.select.field);
             for (index, mux) in fabric.input_muxes.iter().enumerate() {
                 let code = select(config, col, row, mux.select) as usize;
                 let Some(source) = mux.sources.get(code) else { continue };
@@ -107,7 +172,9 @@ fn combinational_edges(
                     Source::Op | Source::Reg | Source::Carry | Source::VRing(_) => continue,
                 };
                 add(from, pin);
-                add(pin, Node::Op { col, row });
+                if lut_depends_on(fabric, lut, index) {
+                    add(pin, Node::Op { col, row });
+                }
                 add(pin, Node::Carry { col, row });
             }
         }
