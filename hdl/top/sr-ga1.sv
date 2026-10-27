@@ -1,7 +1,7 @@
 // The top module of the SR-GA1 FPGA
 //
 // Bitstream information:
-//  Length: 828 bits
+//  Length: 888 bits
 //  Composition:
 //  Bit ranges | Configuration area
 // ------------+------------------------
