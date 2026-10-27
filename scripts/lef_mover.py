@@ -20,11 +20,11 @@ and decimal precision.
 
 Usage:
     python3 lef_mover.py in.lef -r 40*50 -o out.lef
-    python3 lef_mover.py in.lef -x 2.5 -y -1 --in-place
+    python3 lef_mover.py in.lef -x 2.5 -y -1
     python3 lef_mover.py in.lef -x 3 --macro CLB          (only touch CLB)
     python3 lef_mover.py in.lef                           (just check fit)
 
-Output goes to stdout unless -o or --in-place is given. Warnings go to stderr.
+The input file is edited in place unless -o is given. Warnings go to stderr.
 """
 
 import re
@@ -298,9 +298,7 @@ def main():
                     help="translate contents in y by DY microns")
     ap.add_argument('-m', '--macro', action='append',
                     help="only modify this macro (repeatable); default is all macros")
-    out_group = ap.add_mutually_exclusive_group()
-    out_group.add_argument('-o', '--output', help="output LEF file (default: stdout)")
-    out_group.add_argument('-i', '--in-place', action='store_true', help="overwrite the input file")
+    ap.add_argument('-o', '--output', help="output LEF file (default: overwrite the input file)")
     ap.add_argument('-q', '--quiet', action='store_true', help="suppress the per-macro summary")
     args = ap.parse_args()
 
@@ -313,14 +311,8 @@ def main():
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    text = ''.join(result)
-    dest = args.lef if args.in_place else args.output
-    if dest:
-        with open(dest, 'w', newline='') as f:
-            f.write(text)
-    else:
-        sys.stdout.reconfigure(newline='')
-        sys.stdout.write(text)
+    with open(args.output or args.lef, 'w', newline='') as f:
+        f.write(''.join(result))
 
 
 if __name__ == '__main__':
